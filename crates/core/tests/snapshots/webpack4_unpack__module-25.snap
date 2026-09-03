@@ -1,0 +1,17 @@
+---
+source: crates/core/tests/webpack4_unpack.rs
+expression: code
+---
+import { FETCH_DATA } from "./module-19.js";
+import { START, SUCCESS } from "./module-26.js";
+import "./module-13.js";
+export const startFetchingData = ()=>({
+        type: FETCH_DATA + START
+    });
+export const fetchDataSuccess = (payload)=>({
+        type: FETCH_DATA + SUCCESS,
+        payload
+    });
+export const fetchData = ()=>({
+        type: FETCH_DATA
+    });

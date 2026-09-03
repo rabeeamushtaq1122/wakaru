@@ -1,25 +1,243 @@
 # Contributing
 
+Thank you for your interest in contributing to wakaru! This guide covers the practical steps for getting started, adding features, and submitting changes. For deeper dives, see the docs linked throughout.
+
 ## Setup
 
-This project uses [PNPM](https://pnpm.js.org/) for package management. Please make sure you have it installed before proceeding.
-
 1. Fork the repo and create your branch from `main`.
-2. Run `pnpm install` in the repository root.
-3. Run `pnpm dev` to start the development server.
-5. Make your changes!
+2. Install a stable Rust toolchain (via [rustup](https://rustup.rs/)).
+3. Run `cargo test` from the workspace root to verify everything builds and passes.
+4. Make your changes.
 
-## Linting and Type Checking
-
-This project uses [ESLint](https://eslint.org/) and [TypeScript](https://www.typescriptlang.org/) for linting and type checking, respectively. Please make sure your code passes both before submitting a PR.
+Optionally install [cargo-insta](https://insta.rs/) for interactive snapshot review:
 
 ```bash
-pnpm run lint
-pnpm run test
+cargo install cargo-insta
 ```
+
+### Optional: shallow-fetch git dependencies
+
+The formatter currently depends on several OXC crates from a pinned git
+revision. From a fresh Cargo cache, Cargo may need to fetch the OXC monorepo,
+which can be slow.
+
+If you use nightly Cargo, you can opt into Cargo's unstable shallow git fetch
+mode before building or testing:
+
+```bash
+cargo +nightly fetch -Zgit=shallow-deps
+```
+
+This is optional and not required for normal development. The default workflow
+uses stable Cargo.
+
+## Checks
+
+Before submitting a PR, run the relevant checklist in
+[docs/testing.md](docs/testing.md). For most changes, the local gate is:
+
+```bash
+cargo fmt --check       # formatting
+cargo nextest run --workspace
+cargo test --workspace --doc
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+`.cargo/config.toml` sets `INSTA_UPDATE=new`, so a changed snapshot **fails**
+the test and writes a `.snap.new` file. Review the diff, then accept intentional
+changes with `cargo insta accept`.
+
+## Project Structure
+
+wakaru is a Cargo workspace with five crates:
+
+| Crate | Path | Purpose |
+|---|---|---|
+| `wakaru-core` | `crates/core/` | Internal engine: decompile pipeline, transformation rules, and unpackers |
+| `wakaru` | `crates/wakaru/` | Published Rust façade — the public API (see [docs/public-api.md](docs/public-api.md)) |
+| `wakaru-cli` | `crates/cli/` | CLI binary (`wakaru`) built on `clap` |
+| `wakaru-formatter` | `crates/formatter/` | Optional output formatter built on pinned OXC crates |
+| `wakaru-wasm` | `crates/wasm/` | WASM bindings for browser-based decompilation |
+
+Almost all development happens in `wakaru-core`. Key directories within it:
+
+- `src/rules/` -- one file per transformation rule; `pipeline.rs` defines the ordered rule registry
+- `src/unpacker/` -- bundle format detection and module extraction
+- `src/driver.rs` -- orchestrates the full decompile and unpack pipelines
+- `tests/` -- per-rule test files, pipeline integration tests, and snapshot fixtures
+
+For the full architecture overview, see [docs/architecture.md](docs/architecture.md).
+
+## Adding a New Rule
+
+This is the most common type of contribution. Here is a step-by-step walkthrough.
+
+### 1. Create the rule file
+
+Add a new file at `crates/core/src/rules/my_rule.rs`. A minimal rule looks like this:
+
+```rust
+use swc_core::ecma::ast::Expr;
+use swc_core::ecma::visit::{VisitMut, VisitMutWith};
+
+pub struct MyRule;
+
+impl VisitMut for MyRule {
+    fn visit_mut_expr(&mut self, expr: &mut Expr) {
+        expr.visit_mut_children_with(self);
+        // your transformation logic here
+    }
+}
+```
+
+If your rule needs to distinguish free variables (globals) from locally-bound identifiers, take `unresolved_mark`:
+
+```rust
+use swc_core::common::Mark;
+
+pub struct MyRule {
+    unresolved_mark: Mark,
+}
+
+impl MyRule {
+    pub fn new(unresolved_mark: Mark) -> Self {
+        Self { unresolved_mark }
+    }
+}
+```
+
+Then guard identifier matches with `id.ctxt.outer() == self.unresolved_mark`. See [docs/architecture.md](docs/architecture.md) for details on why this is necessary.
+
+### 2. Register the rule in the pipeline
+
+1. In `crates/core/src/rules/mod.rs`, add `mod my_rule;` and `pub use my_rule::MyRule;`.
+2. In `crates/core/src/rules/pipeline.rs`, add a `runner!` macro invocation for your rule and a `RuleDescriptor` entry in the `define_rule_registry!` block at the right position. Entries specify a name, stage, runner function, enablement gate, and optional dependency list.
+
+Pipeline placement matters -- see the "Pipeline Ordering" section below.
+
+### 3. Write tests
+
+Create `crates/core/tests/my_rule_rule.rs`:
+
+```rust
+mod common;
+
+use common::{assert_eq_normalized, render_rule};
+use wakaru_core::rules::MyRule;
+
+fn apply(input: &str) -> String {
+    render_rule(input, |_| MyRule)
+}
+
+#[test]
+fn transforms_target_pattern() {
+    let input = r#"/* minified input */"#;
+    let expected = r#"/* readable output */"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn leaves_unrelated_code_alone() {
+    let input = r#"/* code that should not change */"#;
+    assert_eq_normalized(&apply(input), input);
+}
+```
+
+Cover both positive cases (pattern is transformed) and negative cases (unrelated code is untouched).
+
+### 4. Run full pipeline tests
+
+After adding the rule, run the full test suite to check for snapshot changes in other tests:
+
+```bash
+cargo test
+```
+
+If other snapshots changed, review them carefully. If your rule is placed early in the pipeline, it can cascade through later rules.
+
+## Testing
+
+Tests live in `crates/core/tests/`. The key test helpers are:
+
+| Helper | Use when... |
+|---|---|
+| `render(source)` | You want to test the full decompile pipeline |
+| `render_rule(source, builder)` | You want to test a single rule in isolation |
+| `render_pipeline_until(source, stop_after)` | You want to test up to a specific pipeline stage |
+| `render_pipeline_between(source, start, stop)` | You want to test a range of rules |
+| `assert_eq_normalized(actual, expected)` | Comparing output (normalizes whitespace) |
+
+Common pitfalls:
+
+- Do not use bare expression statements as test inputs (e.g., `65536;`) -- `SimplifySequence` drops them as dead code. Use `const x = 65536;` instead.
+- When `render()` gives unexpected results, switch to `render_rule()` to isolate your rule, or use `render_pipeline_until()` to stop at a specific point.
+
+For the full testing guide (snapshot workflows, test organization, all available helpers), see [docs/testing.md](docs/testing.md).
+
+## Debugging
+
+When a rule is not working as expected, start with the rule trace CLI:
+
+```bash
+cargo run -p wakaru-cli -- debug trace path/to/input.js
+```
+
+This prints a git-style diff for each rule that changes the output, making it easy to see where transformations happen (or fail to happen).
+
+Useful options:
+
+```bash
+# Show all rules, including ones that did not change output
+cargo run -p wakaru-cli -- debug trace path/to/input.js --all
+
+# Trace only a range of rules
+cargo run -p wakaru-cli -- debug trace path/to/input.js --from RemoveVoid --until UnEsm
+```
+
+Common symptoms and what to check:
+
+- **Rule not firing** -- An earlier rule may have changed the AST shape. Use `debug trace` to see what the input looks like by the time your rule runs.
+- **Unexpected variable names** -- Check for a missing `unresolved_mark` guard.
+- **Too many snapshots changed** -- An early pipeline rule is cascading. Check early rules like `SimplifySequence` and `FlipComparisons`.
+- **`cargo test` hangs** -- Likely infinite recursion. Run with `RUST_BACKTRACE=1 cargo test -- --nocapture`.
+
+For the full debugging guide (snapshot layers, fixture repo workflow), see [docs/debugging.md](docs/debugging.md).
+
+## Pipeline Ordering
+
+Rules run in a fixed order defined in `crates/core/src/rules/pipeline.rs`. The pipeline has six stages:
+
+1. **Stage 1: Syntax normalization** -- simplify sequences, flip comparisons, remove void, etc.
+2. **Stage 2: Transpiler helper unwrapping** -- remove Babel/TypeScript helpers, reconstruct module systems
+3. **Stage 3: Structural restoration** -- template literals, while loops, nullish coalescing, optional chaining
+4. **Stage 4: Complex pattern restoration** -- IIFEs, conditionals, parameters, enums, JSX, classes
+5. **Stage 5: Modernization** -- arrow functions, let/const, object shorthand, exponentiation
+6. **Stage 6: Cleanup and renaming** -- import/export rename, smart inline, smart rename, dead code elimination
+
+Order matters because rules depend on earlier ones having run. For example:
+- `UnEsm` (Stage 2) depends on `UnCurlyBraces`, `UnEsmoduleFlag`, and `UnAssignmentMerging` having normalized the AST first.
+- `ArrowFunction` (Stage 5) should run after `UnEs6Class` (Stage 4) so that class methods are not incorrectly converted to arrows.
+
+When placing a new rule, consider:
+- What AST shape does your rule expect? Place it after the rule that produces that shape.
+- Will your rule's output be consumed by a later rule? Make sure it runs first.
+- Use `cargo run -p wakaru-cli -- debug trace` on real-world samples to verify your rule fires at the right point.
+- Run the full test suite and review any snapshot changes to catch ordering issues.
+
+For the full list of rule dependencies, see [docs/rule-dependency-inventory.md](docs/rule-dependency-inventory.md).
 
 ## Commit Message Format
 
 This project follows the [Conventional Commits](https://www.conventionalcommits.org/) specification. Please make sure your commit messages are formatted correctly.
+
+Examples:
+
+```
+feat: add UnNullishCoalescing rule
+fix: handle nested ternary in UnConditionals
+test: add edge case for arrow function with rest params
+refactor: extract shared helper into babel_helper_utils
+docs: update architecture diagram for two-phase pipeline
+```
 
 **Please mention the issue number in the commit message or the PR description.**

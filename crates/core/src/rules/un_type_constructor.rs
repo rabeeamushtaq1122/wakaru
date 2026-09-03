@@ -1,0 +1,122 @@
+use swc_core::common::{Span, Spanned, DUMMY_SP};
+use swc_core::ecma::ast::{
+    ArrayLit, BinExpr, BinaryOp, CallExpr, Expr, ExprOrSpread, Ident, Lit, Number, Str, UnaryExpr,
+    UnaryOp,
+};
+use swc_core::ecma::utils::ExprFactory;
+use swc_core::ecma::visit::{VisitMut, VisitMutWith};
+
+use super::RewriteLevel;
+
+pub struct UnTypeConstructor {
+    level: RewriteLevel,
+}
+
+impl UnTypeConstructor {
+    pub fn new(level: RewriteLevel) -> Self {
+        Self { level }
+    }
+}
+
+impl Default for UnTypeConstructor {
+    fn default() -> Self {
+        Self::new(RewriteLevel::Standard)
+    }
+}
+
+impl VisitMut for UnTypeConstructor {
+    fn visit_mut_expr(&mut self, expr: &mut Expr) {
+        if self.level < RewriteLevel::Aggressive {
+            return;
+        }
+        expr.visit_mut_children_with(self);
+
+        let original_span = expr.span();
+        match expr {
+            // +x → Number(x) — only when x is an Ident
+            Expr::Unary(UnaryExpr {
+                op: UnaryOp::Plus,
+                arg,
+                ..
+            }) if matches!(**arg, Expr::Ident(_)) => {
+                let arg = std::mem::replace(
+                    arg,
+                    Box::new(Expr::Lit(Lit::Num(Number {
+                        span: DUMMY_SP,
+                        value: 0.0,
+                        raw: None,
+                    }))),
+                );
+                *expr = make_call("Number", arg, original_span);
+            }
+
+            // x + "" → String(x)  OR  "str" + "" → "str"
+            Expr::Bin(BinExpr {
+                op: BinaryOp::Add,
+                left,
+                right,
+                ..
+            }) if is_empty_string(right) => {
+                if is_string_lit(left) {
+                    let left = std::mem::replace(
+                        left,
+                        Box::new(Expr::Lit(Lit::Num(Number {
+                            span: DUMMY_SP,
+                            value: 0.0,
+                            raw: None,
+                        }))),
+                    );
+                    *expr = *left;
+                } else {
+                    let left = std::mem::replace(
+                        left,
+                        Box::new(Expr::Lit(Lit::Num(Number {
+                            span: DUMMY_SP,
+                            value: 0.0,
+                            raw: None,
+                        }))),
+                    );
+                    *expr = make_call("String", left, original_span);
+                }
+            }
+
+            // [,,,] → Array(n) — all-holes array with n > 0
+            Expr::Array(ArrayLit { elems, .. }) if is_all_holes(elems) && !elems.is_empty() => {
+                let n = elems.len();
+                *expr = make_call(
+                    "Array",
+                    Box::new(Expr::Lit(Lit::Num(Number {
+                        span: DUMMY_SP,
+                        value: n as f64,
+                        raw: None,
+                    }))),
+                    original_span,
+                );
+            }
+
+            _ => {}
+        }
+    }
+}
+
+fn make_call(name: &str, arg: Box<Expr>, span: Span) -> Expr {
+    Expr::Call(CallExpr {
+        span,
+        ctxt: Default::default(),
+        callee: Expr::Ident(Ident::new_no_ctxt(name.into(), DUMMY_SP)).as_callee(),
+        args: vec![arg.as_arg()],
+        type_args: None,
+    })
+}
+
+fn is_empty_string(expr: &Expr) -> bool {
+    matches!(expr, Expr::Lit(Lit::Str(Str { value, .. })) if value.is_empty())
+}
+
+fn is_string_lit(expr: &Expr) -> bool {
+    matches!(expr, Expr::Lit(Lit::Str(_)))
+}
+
+fn is_all_holes(elems: &[Option<ExprOrSpread>]) -> bool {
+    elems.iter().all(|e| e.is_none())
+}

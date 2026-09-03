@@ -12,6 +12,9 @@ libs/**/dist
 *.local
 coverage
 dist
+target
+crates/wasm/pkg
+.vercel
 
 # Editor directories and files
 !.vscode/extensions.json
@@ -28,3 +31,8 @@ tsconfig.tsbuildinfo
 .turbo
 
 !testcases/**/dist
+!crates/core/tests/bundles/**/dist
+
+# Local workspace
+.claude/
+.agents/

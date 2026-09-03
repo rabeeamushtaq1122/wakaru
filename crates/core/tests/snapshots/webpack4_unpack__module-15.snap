@@ -1,0 +1,59 @@
+---
+source: crates/core/tests/webpack4_unpack.rs
+expression: code
+---
+import _r from "./module-14.js";
+const i = {};
+let _a = 0;
+export const a = (e, t = {}, n)=>{
+    if (typeof t === "string") {
+        t = {
+            path: t
+        };
+    }
+    const { path, exact = false, strict = false, sensitive = false } = t;
+    if (path == null) {
+        return n;
+    }
+    const h = ((path_1, t)=>{
+        const n = `${t.end}${t.strict}${t.sensitive}`;
+        const r = i[n] || (i[n] = {});
+        if (r[path_1]) {
+            return r[path_1];
+        }
+        const u = [];
+        const l = {
+            re: _r(path_1, u, t),
+            keys: u
+        };
+        if (_a < 10000) {
+            r[path_1] = l;
+            _a++;
+        }
+        return l;
+    })(path, {
+        end: exact,
+        strict,
+        sensitive
+    });
+    const { re, keys } = h;
+    const v = re.exec(e);
+    if (!v) {
+        return null;
+    }
+    const b = v[0];
+    const g = v.slice(1);
+    const w = e === b;
+    if (exact && !w) {
+        return null;
+    }
+    return {
+        path,
+        url: path === "/" && b === "" ? "/" : b,
+        isExact: w,
+        params: keys.reduce((e, t, n)=>{
+            e[t.name] = g[n];
+            return e;
+        }, {})
+    };
+};

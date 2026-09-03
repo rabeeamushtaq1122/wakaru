@@ -1,0 +1,106 @@
+mod common;
+use common::{assert_eq_normalized, render, render_rule};
+use wakaru_core::{rules::UnArrayConcatSpread, RewriteLevel};
+
+fn apply_rule_with_level(input: &str, level: RewriteLevel) -> String {
+    render_rule(input, |_| UnArrayConcatSpread::new_with_level(level))
+}
+
+#[test]
+fn simplifies_literal_array_concat_single_element() {
+    let input = r#"
+const x = [a].concat(b);
+"#;
+    let expected = r#"
+const x = [a, ...b];
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn simplifies_literal_array_concat_multiple_elements() {
+    let input = r#"
+const x = [a, b].concat(c);
+"#;
+    let expected = r#"
+const x = [a, b, ...c];
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn simplifies_concat_with_multiple_args() {
+    let input = r#"
+const x = [a].concat(b, c);
+"#;
+    let expected = r#"
+const x = [a, ...b, ...c];
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn simplifies_concat_with_array_literal_arg() {
+    let input = r#"
+const x = [a].concat([b, c]);
+"#;
+    let expected = r#"
+const x = [a, b, c];
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn simplifies_empty_array_concat() {
+    let input = r#"
+const x = [].concat(a);
+"#;
+    let expected = r#"
+const x = [...a];
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn simplifies_spread_over_concat_pattern() {
+    // The Babel class constructor pattern: e.call(...[this].concat(args))
+    // After concat→spread: e.call(...[this, ...args])
+    // The spread-over-array inlining (...[a, ...b] → a, ...b) is handled
+    // by UnArgumentSpread, so we just verify the concat is simplified.
+    let input = r#"
+const x = e.call(...[this].concat(args));
+"#;
+    let output = render(input);
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn preserves_variable_concat() {
+    // Don't transform x.concat(y) where x is not an array literal
+    let input = r#"
+const x = arr.concat(other);
+"#;
+    let output = render(input);
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn minimal_preserves_concat_with_unknown_argument() {
+    let input = r#"
+const x = [this].concat(args);
+"#;
+    let output = apply_rule_with_level(input, RewriteLevel::Minimal);
+    assert_eq_normalized(&output, input);
+}
+
+#[test]
+fn minimal_flattens_concat_with_array_literal_argument() {
+    let input = r#"
+const x = [a].concat([b, c]);
+"#;
+    let expected = r#"
+const x = [a, b, c];
+"#;
+    let output = apply_rule_with_level(input, RewriteLevel::Minimal);
+    assert_eq_normalized(&output, expected);
+}

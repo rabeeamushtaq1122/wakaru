@@ -1,0 +1,1011 @@
+mod common;
+
+use common::{assert_eq_normalized, render, render_pipeline_until, render_rule};
+use wakaru_core::facts::{
+    ModuleFacts, ModuleFactsMap, TypeScriptHelperExportFact, TypeScriptHelperKind,
+};
+use wakaru_core::{rules::UnForOf, validate_output_modules, OutputFindingKind, RewriteLevel};
+
+fn apply_with_level(input: &str, level: RewriteLevel) -> String {
+    render_rule(input, |mark| UnForOf::new_with_mark(mark, level))
+}
+
+#[test]
+fn for_of_from_closure_make_iterator() {
+    // Produced by Closure Compiler v20260629 with SIMPLE optimizations and
+    // language_out=ECMASCRIPT5. The compiler reuses the parameter as its
+    // iterator temporary when the original iterable does not escape.
+    let input = r#"
+function total(items) {
+  var sum = 0;
+  items = $jscomp.makeIterator(items);
+  for (var step = items.next(); !step.done; step = items.next()) {
+    sum += step.value;
+  }
+  return sum;
+}
+"#;
+    let expected = r#"
+function total(items) {
+  var sum = 0;
+  for (const step of items) {
+    sum += step;
+  }
+  return sum;
+}
+"#;
+    assert_eq_normalized(&apply_with_level(input, RewriteLevel::Standard), expected);
+}
+
+#[test]
+fn for_of_from_closure_make_iterator_in_loop_initializer() {
+    // Closure keeps a distinct iterator when the original iterable is used
+    // after the loop.
+    let input = r#"
+function count(items) {
+  for (var iterator = $jscomp.makeIterator(items), step = iterator.next(); !step.done; step = iterator.next()) {
+    use(step.value);
+  }
+  return items.length;
+}
+"#;
+    let expected = r#"
+function count(items) {
+  for (const step of items) {
+    use(step);
+  }
+  return items.length;
+}
+"#;
+    assert_eq_normalized(&apply_with_level(input, RewriteLevel::Standard), expected);
+}
+
+#[test]
+fn minimal_preserves_closure_make_iterator() {
+    let input = r#"
+function total(items) {
+  items = $jscomp.makeIterator(items);
+  for (var step = items.next(); !step.done; step = items.next()) {
+    use(step.value);
+  }
+}
+"#;
+    assert_eq_normalized(&apply_with_level(input, RewriteLevel::Minimal), input);
+}
+
+#[test]
+fn for_of_from_locally_bootstrapped_closure_namespace() {
+    let input = r#"
+var $jscomp = $jscomp || {};
+$jscomp.makeIterator = function(value) { return makeIterator(value); };
+function total(items) {
+  var sum = 0;
+  items = $jscomp.makeIterator(items);
+  for (var step = items.next(); !step.done; step = items.next()) {
+    sum += step.value;
+  }
+  return sum;
+}
+"#;
+    let expected = r#"
+var $jscomp = $jscomp || {};
+$jscomp.makeIterator = function(value) { return makeIterator(value); };
+function total(items) {
+  var sum = 0;
+  for (const step of items) {
+    sum += step;
+  }
+  return sum;
+}
+"#;
+    assert_eq_normalized(&apply_with_level(input, RewriteLevel::Standard), expected);
+}
+
+#[test]
+fn closure_make_iterator_requires_namespace_provenance() {
+    let input = r#"
+function total($jscomp, items) {
+  var sum = 0;
+  items = $jscomp.makeIterator(items);
+  for (var step = items.next(); !step.done; step = items.next()) {
+    sum += step.value;
+  }
+  return sum;
+}
+"#;
+    assert_eq_normalized(&apply_with_level(input, RewriteLevel::Standard), input);
+}
+
+#[test]
+fn closure_make_iterator_preserves_escaping_iterator_binding() {
+    let input = r#"
+function total(items) {
+  var sum = 0;
+  items = $jscomp.makeIterator(items);
+  for (var step = items.next(); !step.done; step = items.next()) {
+    sum += step.value;
+  }
+  consumeIterator(items);
+  return sum;
+}
+"#;
+    assert_eq_normalized(&apply_with_level(input, RewriteLevel::Standard), input);
+}
+
+#[test]
+fn closure_make_iterator_preserves_iterator_escaping_enclosing_block() {
+    let input = r#"
+var $jscomp = $jscomp || {};
+function demo(flag, items) {
+  if (flag) {
+    var iterator = $jscomp.makeIterator(items);
+    for (var step = iterator.next(); !step.done; step = iterator.next()) {
+      consume(step.value);
+    }
+  }
+  return iterator;
+}
+"#;
+    let before = render_pipeline_until(input, "ArrowReturn");
+    let after = render_pipeline_until(input, "UnForOf");
+    assert_eq_normalized(&after, &before);
+}
+
+#[test]
+fn basic_for_to_for_of() {
+    let input = r#"for (let i = 0, arr = items; i < arr.length; i++) { const x = arr[i]; console.log(x); }"#;
+    let expected = r#"for (const x of items) { console.log(x); }"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn minimal_does_not_convert_basic_for_to_for_of() {
+    let input = r#"for (let i = 0, arr = items; i < arr.length; i++) { const x = arr[i]; console.log(x); }"#;
+    assert_eq_normalized(&apply_with_level(input, RewriteLevel::Minimal), input);
+}
+
+#[test]
+fn for_of_with_block_body() {
+    let input = r#"for (let Y = 0, V = list; Y < V.length; Y++) { const Z = V[Y]; if (Z != null) { process(Z); } }"#;
+    let expected = r#"for (const Z of list) { if (Z != null) { process(Z); } }"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn for_of_with_method_call_iterable() {
+    let input =
+        r#"for (let Y = 0, V = Object.keys(obj); Y < V.length; Y++) { const Z = V[Y]; use(Z); }"#;
+    let expected = r#"for (const Z of Object.keys(obj)) { use(Z); }"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn no_transform_when_index_used_in_body() {
+    // Index `i` is used beyond just arr[i], so can't convert
+    let input = r#"for (let i = 0, arr = items; i < arr.length; i++) { const x = arr[i]; console.log(i, x); }"#;
+    assert_eq_normalized(&render(input), input);
+}
+
+#[test]
+fn no_transform_when_arr_used_in_body() {
+    // arr variable used beyond arr[i] and arr.length
+    let input = r#"for (let i = 0, arr = items; i < arr.length; i++) { const x = arr[i]; console.log(arr.length, x); }"#;
+    assert_eq_normalized(&render(input), input);
+}
+
+#[test]
+fn no_transform_when_no_elem_decl() {
+    // No `const elem = arr[i]` as first statement
+    let input = r#"for (let i = 0, arr = items; i < arr.length; i++) { console.log(arr[i]); }"#;
+    assert_eq_normalized(&render(input), input);
+}
+
+#[test]
+fn no_transform_regular_for_loop() {
+    let input = r#"for (let i = 0; i < 10; i++) { console.log(i); }"#;
+    assert_eq_normalized(&render(input), input);
+}
+
+#[test]
+fn for_of_uses_let_when_elem_reassigned() {
+    // P3 regression: elem is reassigned so for-of must use `let`, not `const`
+    let input = r#"for (let i = 0, arr = items; i < arr.length; i++) { let elem = arr[i]; elem = normalize(elem); process(elem); }"#;
+    let expected = r#"for (let elem of items) { elem = normalize(elem); process(elem); }"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn for_of_single_decl_arr_form() {
+    let input =
+        r#"for (let Y = 0, V = B.split("."); Y < V.length; Y++) { const Z = V[Y]; process(Z); }"#;
+    let expected = r#"for (const Z of B.split(".")) { process(Z); }"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn for_of_direct_array_index_form() {
+    // Babel with the `iterableIsArray` assumption emits direct indexed loops.
+    let input = r#"for (let i = 0; i < items.length; i++) { const item = items[i]; use(item); }"#;
+    let expected = r#"for (const item of items) { use(item); }"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn for_of_direct_array_index_uses_let_when_elem_reassigned() {
+    let input = r#"for (let i = 0; i < items.length; i++) { let item = items[i]; item = normalize(item); use(item); }"#;
+    let expected = r#"for (let item of items) { item = normalize(item); use(item); }"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn indexed_loop_keeps_var_index_used_by_a_later_loop() {
+    let input = r#"
+const index = -1;
+function replay(items) {
+  const seen = [];
+  for (var index = 0; index < items.length; index++) {
+    var item = items[index];
+    seen.push(item);
+  }
+  for (index = 0; index < items.length; index++) {
+    seen.push(items[index]);
+  }
+  return seen;
+}
+"#;
+
+    let after_rule = apply_with_level(input, RewriteLevel::Standard);
+    assert_eq_normalized(&after_rule, input);
+
+    let output = render(input);
+    let findings = validate_output_modules(&[("input.js".to_string(), output.clone())]);
+    assert!(
+        findings.is_empty(),
+        "the later loop must retain the function-scoped index binding:\n{output}\n{findings:#?}"
+    );
+}
+
+#[test]
+fn preserves_legacy_call_target_for_of_over_empty_array() {
+    let input = r#"
+for (observe("never") of []);
+keepRunning();
+"#;
+    let output = render(input);
+
+    assert!(
+        output.contains("observe"),
+        "authored legacy syntax must remain visible: {output}"
+    );
+    assert!(
+        output.contains("keepRunning"),
+        "neighboring statements must remain: {output}"
+    );
+    let findings = validate_output_modules(&[("input.js".to_string(), output.clone())]);
+    assert_eq!(
+        findings.len(),
+        1,
+        "the preserved engine-specific syntax should remain visible to validation: {output}\n{findings:#?}"
+    );
+    assert_eq!(findings[0].kind, OutputFindingKind::ParseError);
+    assert!(
+        findings[0].message.contains("TS2406"),
+        "SWC should report the non-assignable call target: {findings:#?}"
+    );
+}
+
+#[test]
+fn legacy_empty_array_loop_body_is_not_rewritten() {
+    let input = r#"
+function f() {
+    for (g() of []) {
+        function helper() { return 1; }
+        var { a, b: [c] } = source();
+    }
+    use(helper, a, c);
+}
+"#;
+
+    for level in [RewriteLevel::Standard, RewriteLevel::Aggressive] {
+        assert_eq_normalized(&apply_with_level(input, level), input);
+    }
+}
+
+#[test]
+fn indexed_loop_keeps_iterable_temp_used_after_the_loop() {
+    let input = r#"
+function replay(items) {
+  for (var index = 0, values = items; index < values.length; index++) {
+    var item = values[index];
+    use(item);
+  }
+  return values;
+}
+"#;
+
+    assert_eq_normalized(&apply_with_level(input, RewriteLevel::Standard), input);
+}
+
+#[test]
+fn for_of_preserves_var_when_var_decl_survives() {
+    let input = r#"
+function f(items) {
+  var item = fallback;
+  for (let i = 0; i < items.length; i++) {
+    var item = items[i];
+    use(item);
+  }
+  return item;
+}
+"#;
+    let expected = r#"
+function f(items) {
+  var item = fallback;
+  for (var item of items) {
+    use(item);
+  }
+  return item;
+}
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn for_of_destructuring_preserves_mixed_var_binding_kind() {
+    let input = r#"
+function recover(rows) {
+  var key = 0;
+  consume(key);
+  for (var index = 0; index < rows.length; index++) {
+    var pair = rows[index], key = pair[0];
+  }
+}
+"#;
+    let expected = r#"
+function recover(rows) {
+  var key = 0;
+  consume(key);
+  for (var [key] of rows) {}
+}
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn for_of_destructuring_from_ts_index_form() {
+    let input = r#"for (let i = 0, entries_1 = entries; i < entries_1.length; i++) { const _a = entries_1[i], key = _a[0], value = _a[1]; use(key, value); }"#;
+    let expected = r#"for (const [key, value] of entries) { use(key, value); }"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn for_of_destructuring_from_direct_array_index_form() {
+    let input = r#"for (let i = 0; i < entries.length; i++) { const _entry = entries[i], key = _entry[0], value = _entry[1]; use(key, value); }"#;
+    let expected = r#"for (const [key, value] of entries) { use(key, value); }"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn for_of_destructuring_uses_let_when_binding_reassigned() {
+    let input = r#"for (let i = 0; i < entries.length; i++) { let _entry = entries[i], key = _entry[0], value = _entry[1]; key = normalize(key); use(key, value); }"#;
+    let expected =
+        r#"for (let [key, value] of entries) { key = normalize(key); use(key, value); }"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn no_transform_destructuring_when_temp_used_later() {
+    let input = r#"for (let i = 0; i < entries.length; i++) { const _entry = entries[i], key = _entry[0], value = _entry[1]; use(_entry, key, value); }"#;
+    let expected = r#"for (let i = 0; i < entries.length; i++) { const _entry = entries[i]; const key = _entry[0]; const value = _entry[1]; use(_entry, key, value); }"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn for_of_from_babel_iterator_helper() {
+    let input = r#"
+let step;
+const iterator = _createForOfIteratorHelper(items);
+try {
+  for (iterator.s(); !(step = iterator.n()).done;) {
+    const item = step.value;
+    use(item);
+  }
+} catch (err) {
+  iterator.e(err);
+} finally {
+  iterator.f();
+}
+"#;
+    let expected = r#"
+for (const item of items) {
+  use(item);
+}
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn for_of_from_babel_iterator_helper_rewrites_value_refs() {
+    let input = r#"
+let step;
+let last;
+const iterator = _createForOfIteratorHelper(items);
+try {
+  for (iterator.s(); !(step = iterator.n()).done;) {
+    last = step.value;
+  }
+} catch (err) {
+  iterator.e(err);
+} finally {
+  iterator.f();
+}
+return last;
+"#;
+    let expected = r#"
+let last;
+for (const step of items) {
+  last = step;
+}
+return last;
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn for_of_from_babel_iterator_helper_decl_first() {
+    let input = r#"
+const iterator = _createForOfIteratorHelper(items);
+let step;
+try {
+  for (iterator.s(); !(step = iterator.n()).done;) {
+    const item = step.value;
+    use(item);
+  }
+} catch (err) {
+  iterator.e(err);
+} finally {
+  iterator.f();
+}
+"#;
+    let expected = r#"
+for (const item of items) {
+  use(item);
+}
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn for_of_from_babel_loose_iterator_helper() {
+    let input = r#"
+let step;
+for (const iterator = _createForOfIteratorHelperLoose(items); !(step = iterator()).done;) {
+  const item = step.value;
+  use(item);
+}
+"#;
+    let expected = r#"
+for (const item of items) {
+  use(item);
+}
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn for_of_destructuring_from_iterator_helper() {
+    let input = r#"
+const iterator = _createForOfIteratorHelper(entries);
+let step;
+try {
+  for (iterator.s(); !(step = iterator.n()).done;) {
+    const pair = step.value;
+    const key = pair[0];
+    const value = pair[1];
+    use(key, value);
+  }
+} catch (err) {
+  iterator.e(err);
+} finally {
+  iterator.f();
+}
+"#;
+    let expected = r#"
+for (const [key, value] of entries) {
+  use(key, value);
+}
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn iterator_value_destructuring_preserves_mixed_var_binding_kind() {
+    let input = r#"
+function recover(entries) {
+  var key = 0;
+  consume(key);
+  const iterator = _createForOfIteratorHelper(entries);
+  let step;
+  try {
+    for (iterator.s(); !(step = iterator.n()).done;) {
+      const pair = step.value;
+      var key = pair[0];
+    }
+  } catch (err) {
+    iterator.e(err);
+  } finally {
+    iterator.f();
+  }
+}
+"#;
+    let expected = r#"
+function recover(entries) {
+  var key = 0;
+  consume(key);
+  for (var [key] of entries) {}
+}
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn for_of_destructuring_from_iterator_helper_read_call() {
+    let input = r#"
+const iterator = _createForOfIteratorHelper(entries);
+let step;
+try {
+  for (iterator.s(); !(step = iterator.n()).done;) {
+    const pair = _slicedToArray(step.value, 2);
+    const key = pair[0];
+    const value = pair[1];
+    use(key, value);
+  }
+} catch (err) {
+  iterator.e(err);
+} finally {
+  iterator.f();
+}
+"#;
+    let expected = r#"
+for (const [key, value] of entries) {
+  use(key, value);
+}
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn iterator_call_destructuring_preserves_mixed_var_binding_kind() {
+    let input = r#"
+function recover(entries) {
+  var key = 0;
+  consume(key);
+  const iterator = _createForOfIteratorHelper(entries);
+  let step;
+  try {
+    for (iterator.s(); !(step = iterator.n()).done;) {
+      const pair = _slicedToArray(step.value, 1);
+      var key = pair[0];
+    }
+  } catch (err) {
+    iterator.e(err);
+  } finally {
+    iterator.f();
+  }
+}
+"#;
+    let expected = r#"
+function recover(entries) {
+  var key = 0;
+  consume(key);
+  for (var [key] of entries) {}
+}
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn for_of_promotes_body_destructuring_from_iterator_value() {
+    let input = r#"
+const iterator = _createForOfIteratorHelper(entries);
+let step;
+try {
+  for (iterator.s(); !(step = iterator.n()).done;) {
+    const [key, value] = step.value;
+    use(key, value);
+  }
+} catch (err) {
+  iterator.e(err);
+} finally {
+  iterator.f();
+}
+"#;
+    let expected = r#"
+for (const [key, value] of entries) {
+  use(key, value);
+}
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn for_of_preserves_destructuring_from_iterator_result() {
+    let input = r#"
+const iterator = _createForOfIteratorHelper(entries);
+let step;
+try {
+  for (iterator.s(); !(step = iterator.n()).done;) {
+    const [key, value] = step;
+    use(key, value);
+  }
+} catch (err) {
+  iterator.e(err);
+} finally {
+  iterator.f();
+}
+"#;
+    assert_eq_normalized(&render(input), input);
+}
+
+#[test]
+fn for_of_preserves_destructuring_helper_from_iterator_result() {
+    let input = r#"
+const iterator = _createForOfIteratorHelper(entries);
+let step;
+try {
+  for (iterator.s(); !(step = iterator.n()).done;) {
+    const pair = _slicedToArray(step, 2);
+    const key = pair[0];
+    const value = pair[1];
+    use(key, value);
+  }
+} catch (err) {
+  iterator.e(err);
+} finally {
+  iterator.f();
+}
+"#;
+    assert_eq_normalized(&render(input), input);
+}
+
+#[test]
+fn for_of_from_ts_values_helper() {
+    let input = r#"
+var tslib = require("tslib");
+let errorState;
+let iteratorReturn;
+try {
+  for (var iterator = tslib.__values(items), step = iterator.next(); !step.done; step = iterator.next()) {
+    const item = step.value;
+    use(item);
+  }
+} catch (error) {
+  errorState = { error };
+} finally {
+  try {
+    if (step && !step.done && (iteratorReturn = iterator.return)) {
+      iteratorReturn.call(iterator);
+    }
+  } finally {
+    if (errorState) {
+      throw errorState.error;
+    }
+  }
+}
+"#;
+    let expected = r#"
+import tslib from "tslib";
+for (const item of items) {
+  use(item);
+}
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn removes_consumed_mangled_inline_ts_values_helper() {
+    // Produced by TypeScript ES5 downlevelIteration, then Terser compress+mangle.
+    let input = r#"
+var r=this&&this.__values||function(r){var e="function"==typeof Symbol&&Symbol.iterator,t=e&&r[e],n=0;if(t)return t.call(r);if(r&&"number"==typeof r.length)return{next:function(){return r&&n>=r.length&&(r=void 0),{value:r&&r[n++],done:!r}}};throw new TypeError(e?"Object is not iterable.":"Symbol.iterator is not defined.")};export function f(e){var t,n;try{for(var o=r(e),i=o.next();!i.done;i=o.next()){var l=i.value;use(l)}}catch(r){t={error:r}}finally{try{i&&!i.done&&(n=o.return)&&n.call(o)}finally{if(t)throw t.error}}}
+"#;
+    let expected = r#"
+export function f(e) {
+  for (const l of e) {
+    use(l);
+  }
+}
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn for_of_preserves_unproven_ts_values_member() {
+    let input = r#"
+function run(tslib, items) {
+  let errorState;
+  let iteratorReturn;
+  try {
+    for (var iterator = tslib.__values(items), step = iterator.next(); !step.done; step = iterator.next()) {
+      const item = step.value;
+      use(item);
+    }
+  } catch (error) {
+    errorState = { error };
+  } finally {
+    try {
+      if (step && !step.done && (iteratorReturn = iterator.return)) {
+        iteratorReturn.call(iterator);
+      }
+    } finally {
+      if (errorState) {
+        throw errorState.error;
+      }
+    }
+  }
+}
+"#;
+    assert_eq_normalized(&apply_with_level(input, RewriteLevel::Standard), input);
+}
+
+#[test]
+fn for_of_preserves_unproven_ts_values_ident() {
+    let input = r#"
+function run(__values, items) {
+  let errorState;
+  let iteratorReturn;
+  try {
+    for (var iterator = __values(items), step = iterator.next(); !step.done; step = iterator.next()) {
+      const item = step.value;
+      use(item);
+    }
+  } catch (error) {
+    errorState = { error };
+  } finally {
+    try {
+      if (step && !step.done && (iteratorReturn = iterator.return)) {
+        iteratorReturn.call(iterator);
+      }
+    } finally {
+      if (errorState) {
+        throw errorState.error;
+      }
+    }
+  }
+}
+"#;
+    assert_eq_normalized(&apply_with_level(input, RewriteLevel::Standard), input);
+}
+
+#[test]
+fn for_of_from_cross_module_values_namespace_factory() {
+    let input = r#"
+import { tslibModule } from "./tslib-module.js";
+const tslib = tslibModule();
+let errorState;
+let iteratorReturn;
+try {
+  for (var iterator = tslib.__values(items), step = iterator.next(); !step.done; step = iterator.next()) {
+    const item = step.value;
+    use(item);
+  }
+} catch (error) {
+  errorState = { error };
+} finally {
+  try {
+    if (step && !step.done && (iteratorReturn = iterator.return)) {
+      iteratorReturn.call(iterator);
+    }
+  } finally {
+    if (errorState) {
+      throw errorState.error;
+    }
+  }
+}
+"#;
+    let expected = r#"
+import { tslibModule } from "./tslib-module.js";
+const tslib = tslibModule();
+for (const item of items) {
+  use(item);
+}
+"#;
+
+    let mut facts = ModuleFactsMap::new();
+    facts.insert(
+        "./tslib-module.js",
+        ModuleFacts {
+            ts_helper_exports: vec![TypeScriptHelperExportFact {
+                exported: "__values".into(),
+                local: Some("values".into()),
+                kind: TypeScriptHelperKind::Values,
+            }],
+            ..Default::default()
+        },
+    );
+
+    let output = render_rule(input, |mark| {
+        UnForOf::new_with_mark_and_facts(mark, RewriteLevel::Standard, &facts)
+    });
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn for_of_from_nested_cross_module_values_namespace_factory() {
+    let input = r#"
+import { tslibModule } from "./tslib-module.js";
+export function run(items) {
+  const tslib = tslibModule();
+  let errorState;
+  let iteratorReturn;
+  try {
+    for (var iterator = tslib.__values(items), step = iterator.next(); !step.done; step = iterator.next()) {
+      const item = step.value;
+      use(item);
+    }
+  } catch (error) {
+    errorState = { error };
+  } finally {
+    try {
+      if (step && !step.done && (iteratorReturn = iterator.return)) {
+        iteratorReturn.call(iterator);
+      }
+    } finally {
+      if (errorState) {
+        throw errorState.error;
+      }
+    }
+  }
+}
+"#;
+    let expected = r#"
+import { tslibModule } from "./tslib-module.js";
+export function run(items) {
+  const tslib = tslibModule();
+  for (const item of items) {
+    use(item);
+  }
+}
+"#;
+
+    let mut facts = ModuleFactsMap::new();
+    facts.insert(
+        "./tslib-module.js",
+        ModuleFacts {
+            ts_helper_exports: vec![TypeScriptHelperExportFact {
+                exported: "__values".into(),
+                local: Some("values".into()),
+                kind: TypeScriptHelperKind::Values,
+            }],
+            ..Default::default()
+        },
+    );
+
+    let output = render_rule(input, |mark| {
+        UnForOf::new_with_mark_and_facts(mark, RewriteLevel::Standard, &facts)
+    });
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn for_of_from_swc_symbol_iterator_helper() {
+    let input = r#"
+let normal = true;
+let didError = false;
+let iteratorError;
+try {
+  let step;
+  for (var iterator = items[Symbol.iterator](); !(normal = (step = iterator.next()).done); normal = true) {
+    const item = step.value;
+    use(item);
+  }
+} catch (err) {
+  didError = true;
+  iteratorError = err;
+} finally {
+  try {
+    if (!normal && iterator.return != null) {
+      iterator.return();
+    }
+  } finally {
+    if (didError) {
+      throw iteratorError;
+    }
+  }
+}
+"#;
+    let expected = r#"
+for (const item of items) {
+  use(item);
+}
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn for_of_from_swc_symbol_iterator_helper_merged_header() {
+    // The raw swc-es5 (+ terser) shape: completion flags merged into one `var`
+    // and the uninitialized `step` still inside the for header. UnVariableMerging
+    // must pull `step` out (a no-init declarator is always safe to extract) or
+    // the UnForOf matcher never fires. Regression test for the for-of matrix
+    // drop to 73.9% (see un_variable_merging_rule.rs).
+    let input = r#"
+export function f(items) {
+  var normal = true, didError = false, iteratorError = void 0;
+  try {
+    for (var iterator = items[Symbol.iterator](), step; !(normal = (step = iterator.next()).done); normal = true) {
+      var item = step.value;
+      use(item);
+    }
+  } catch (err) {
+    didError = true;
+    iteratorError = err;
+  } finally {
+    try {
+      normal || null == iterator.return || iterator.return();
+    } finally {
+      if (didError) throw iteratorError;
+    }
+  }
+}
+"#;
+    let expected = r#"
+export function f(items) {
+  for (const item of items) {
+    use(item);
+  }
+}
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn shadowed_binding_does_not_force_let() {
+    let input = r#"
+for (var i = 0; i < items.length; i++) {
+    var item = items[i];
+    console.log(item);
+    {
+        let item = transform();
+        item = item + 1;
+    }
+}
+"#;
+    let expected = r#"
+for (const item of items) {
+  console.log(item);
+  {
+    let item = transform();
+    item = item + 1;
+  }
+}
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn recovers_for_of_from_imported_iterator_helper() {
+    // The for-of loop is recovered by shape matching. The helper import
+    // becomes dead — DeadImports removes it when DceMode is enabled.
+    let input = r#"
+import _createForOfIteratorHelper from "@babel/runtime/helpers/createForOfIteratorHelper";
+let step;
+const iterator = _createForOfIteratorHelper(items);
+try {
+  for (iterator.s(); !(step = iterator.n()).done;) {
+    const item = step.value;
+    use(item);
+  }
+} catch (err) {
+  iterator.e(err);
+} finally {
+  iterator.f();
+}
+"#;
+    let expected = r#"
+import _createForOfIteratorHelper from "@babel/runtime/helpers/createForOfIteratorHelper";
+for (const item of items) {
+  use(item);
+}
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
