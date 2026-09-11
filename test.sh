@@ -40,9 +40,9 @@ trap 'rm -f "$config_path"' EXIT
 printf '[profile.default.junit]\npath = "%s"\n' "$output_path" > "$config_path"
 
 if [[ "$mode" == base ]]; then
-  cargo nextest run -p wakaru-core --test un_async_await_rule \
+  cargo nextest run -p wakaru-core --test un_esm_rule \
     --config-file "$config_path"
 else
-  cargo nextest run -p wakaru-core --test un_async_await_rule_7c4a9e \
+  cargo nextest run -p wakaru-core --test un_esm_rule_8c4d2e \
     --config-file "$config_path"
 fi

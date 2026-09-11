@@ -1,5 +1,11 @@
-Title: Require canonical awaiter wrapper frames before unwrapping
+Title: Harden named require recovery against unsafe CommonJS boundaries
 
-Fix async/await recovery so an awaiter wrapper is removed only when its call has the canonical compiler-generated frame. The wrapper call must have exactly four non-spread arguments: the receiver value, the arguments slot, the Promise constructor slot, and a parameterless generator function.
+Improve named-member recovery for top-level CommonJS imports without changing runtime behavior.
 
-Accept receiver values including this, a void expression whose operand is a literal, the unresolved global undefined, and a resolver-proven local alias. In the arguments slot, accept only a void expression whose operand is a literal or the unresolved global undefined. Accept only the unresolved global Promise or undefined, or a void expression whose operand is a literal, in the Promise constructor slot.
+When converting a top-level binding such as `var UIBase = require("./dep.js").UIBase` into a named import, recover it only when the property name is a valid JavaScript identifier and the same provider member is not mutated anywhere in the module. Treat assignments, compound assignments, updates, deletes, and for-in/for-of assignment heads as mutations.
+
+Preserve the original CommonJS form when the provider member can change, when the property name cannot be represented as an identifier, or when the candidate is an early read from the current module's own CommonJS export surface. In particular, do not partially cross the CommonJS boundary for a self-module read that occurs before its exported member is initialized.
+
+Keep existing safe recovery behavior for valid, unmutated dependency members and for already-supported self-module export surfaces. Scope and binding checks must distinguish the global `require` from locally shadowed bindings, and the implementation must continue using the repository's existing pipeline and import-generation conventions.
+
+Add focused tests for invalid identifier property names, every supported provider-member mutation form, early self-module reads, and a valid named import that remains recoverable even when a later provider mutation is preserved.
