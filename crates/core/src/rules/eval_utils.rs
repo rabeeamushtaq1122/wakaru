@@ -2,7 +2,7 @@ use swc_core::atoms::Atom;
 use swc_core::ecma::ast::{Callee, Expr, Lit};
 use swc_core::ecma::visit::{Visit, VisitWith};
 
-use crate::utils::paren::strip_parens;
+use super::expr_utils::strip_transparent_types;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EvalCallSource {
@@ -87,14 +87,14 @@ pub(crate) fn is_direct_eval_call(expr: &swc_core::ecma::ast::CallExpr) -> bool 
     let Callee::Expr(callee) = &expr.callee else {
         return false;
     };
-    matches!(strip_parens(callee.as_ref()), Expr::Ident(id) if id.sym == "eval")
+    matches!(strip_transparent_types(callee.as_ref()), Expr::Ident(id) if id.sym == "eval")
 }
 
 fn is_indirect_eval_call(expr: &swc_core::ecma::ast::CallExpr) -> bool {
     let Callee::Expr(callee) = &expr.callee else {
         return false;
     };
-    match strip_parens(callee.as_ref()) {
+    match strip_transparent_types(callee.as_ref()) {
         Expr::Seq(seq) => {
             matches!(seq.exprs.last().map(|expr| expr.as_ref()), Some(Expr::Ident(id)) if id.sym == "eval")
         }
@@ -107,14 +107,14 @@ fn is_object_wrapped_eval_call(call: &swc_core::ecma::ast::CallExpr) -> bool {
     let Callee::Expr(callee) = &call.callee else {
         return false;
     };
-    if !matches!(strip_parens(callee.as_ref()), Expr::Ident(id) if id.sym == "Object") {
+    if !matches!(strip_transparent_types(callee.as_ref()), Expr::Ident(id) if id.sym == "Object") {
         return false;
     }
     let Some(arg) = call.args.first() else {
         return false;
     };
     arg.spread.is_none()
-        && matches!(strip_parens(arg.expr.as_ref()), Expr::Ident(id) if id.sym == "eval")
+        && matches!(strip_transparent_types(arg.expr.as_ref()), Expr::Ident(id) if id.sym == "eval")
 }
 
 fn eval_static_string(expr: &Expr) -> Option<String> {

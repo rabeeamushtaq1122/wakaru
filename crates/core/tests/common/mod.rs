@@ -12,10 +12,15 @@ use wakaru_core::{
 
 #[allow(dead_code)]
 pub fn render_pipeline(source: &str) -> String {
+    render_pipeline_with_filename(source, "fixture.js")
+}
+
+#[allow(dead_code)]
+pub fn render_pipeline_with_filename(source: &str, filename: &str) -> String {
     decompile(
         source,
         DecompileOptions {
-            filename: "fixture.js".to_string(),
+            filename: filename.to_string(),
             ..Default::default()
         },
     )

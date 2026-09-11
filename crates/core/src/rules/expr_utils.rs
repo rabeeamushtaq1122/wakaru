@@ -1,6 +1,21 @@
 use swc_core::common::Mark;
 use swc_core::ecma::ast::{Expr, Ident, Lit, MemberProp, UnaryExpr, UnaryOp};
 
+use crate::utils::paren::strip_parens;
+
+pub fn strip_transparent_types(expr: &Expr) -> &Expr {
+    let expr = strip_parens(expr);
+    match expr {
+        Expr::TsAs(wrapper) => strip_transparent_types(&wrapper.expr),
+        Expr::TsSatisfies(wrapper) => strip_transparent_types(&wrapper.expr),
+        Expr::TsNonNull(wrapper) => strip_transparent_types(&wrapper.expr),
+        Expr::TsTypeAssertion(wrapper) => strip_transparent_types(&wrapper.expr),
+        Expr::TsInstantiation(wrapper) => strip_transparent_types(&wrapper.expr),
+        Expr::TsConstAssertion(wrapper) => strip_transparent_types(&wrapper.expr),
+        _ => expr,
+    }
+}
+
 pub fn exprs_structurally_equal(a: &Expr, b: &Expr) -> bool {
     match (a, b) {
         (Expr::Ident(ai), Expr::Ident(bi)) => ai.sym == bi.sym && ai.ctxt == bi.ctxt,

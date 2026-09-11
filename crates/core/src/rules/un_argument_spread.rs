@@ -1,22 +1,34 @@
-use swc_core::common::{Mark, DUMMY_SP};
+use std::collections::HashSet;
+
+use swc_core::common::{Mark, Span, Spanned, DUMMY_SP};
 use swc_core::ecma::ast::{
-    AssignOp, AssignTarget, CallExpr, Callee, Expr, ExprOrSpread, ExprStmt, Ident, Lit, MemberExpr,
-    MemberProp, SimpleAssignTarget, Stmt,
+    AssignOp, AssignTarget, AssignTargetPat, AutoAccessor, CallExpr, Callee, ClassProp,
+    Constructor, Expr, ExprOrSpread, ExprStmt, ForHead, GetterProp, Ident, ImportDecl,
+    ImportSpecifier, Lit, MemberExpr, MemberProp, Module, ObjectPatProp, OptChainBase, Pat,
+    PrivateProp, PropName, SetterProp, SimpleAssignTarget, StaticBlock, Stmt, UnaryExpr, UnaryOp,
+    UpdateExpr, VarDeclKind,
 };
-use swc_core::ecma::visit::{VisitMut, VisitMutWith};
+use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 use super::decl_utils::{
     can_remove_prior_uninitialized_decls, ident_is_used_in_stmts_excluding_bindings,
-    remove_prior_uninitialized_decls, same_ident, UninitializedDeclKind,
+    remove_prior_uninitialized_decls, same_ident, BindingId, UninitializedDeclKind,
 };
-use super::expr_utils::{exprs_structurally_equal, is_unresolved_undefined};
+use super::eval_utils::is_direct_eval_call;
+use super::expr_utils::{
+    exprs_structurally_equal, is_unresolved_ident, is_unresolved_undefined, strip_transparent_types,
+};
 use super::RewriteLevel;
 
-use crate::utils::paren::strip_parens;
+use crate::utils::paren::{strip_parens, strip_parens_owned};
 
 pub struct UnArgumentSpread {
     unresolved_mark: Mark,
     level: RewriteLevel,
+    stable_bindings: HashSet<BindingId>,
+    with_depth: usize,
+    top_level_direct_eval: bool,
+    direct_eval_scopes: Vec<Span>,
 }
 
 impl UnArgumentSpread {
@@ -24,6 +36,10 @@ impl UnArgumentSpread {
         Self {
             unresolved_mark,
             level,
+            stable_bindings: HashSet::new(),
+            with_depth: 0,
+            top_level_direct_eval: false,
+            direct_eval_scopes: Vec::new(),
         }
     }
 }
@@ -35,6 +51,21 @@ impl Default for UnArgumentSpread {
 }
 
 impl VisitMut for UnArgumentSpread {
+    fn visit_mut_module(&mut self, module: &mut Module) {
+        self.stable_bindings = collect_stable_bindings(module);
+        let eval_scopes = collect_direct_eval_scopes(module);
+        self.top_level_direct_eval = eval_scopes.top_level;
+        self.direct_eval_scopes = eval_scopes.functions;
+        module.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_with_stmt(&mut self, stmt: &mut swc_core::ecma::ast::WithStmt) {
+        stmt.obj.visit_mut_with(self);
+        self.with_depth += 1;
+        stmt.body.visit_mut_with(self);
+        self.with_depth -= 1;
+    }
+
     fn visit_mut_stmts(&mut self, stmts: &mut Vec<Stmt>) {
         stmts.visit_mut_children_with(self);
 
@@ -102,14 +133,28 @@ impl VisitMut for UnArgumentSpread {
             return;
         };
 
-        match try_convert_apply(call, self.unresolved_mark) {
+        match try_convert_apply(
+            call,
+            self.unresolved_mark,
+            &self.stable_bindings,
+            self.with_depth,
+            self.top_level_direct_eval,
+            &self.direct_eval_scopes,
+        ) {
             Ok(new_expr) => *expr = new_expr,
             Err(original_call) => *expr = Expr::Call(original_call),
         }
     }
 }
 
-fn try_convert_apply(call: CallExpr, unresolved_mark: Mark) -> Result<Expr, CallExpr> {
+fn try_convert_apply(
+    call: CallExpr,
+    unresolved_mark: Mark,
+    stable_bindings: &HashSet<BindingId>,
+    with_depth: usize,
+    top_level_direct_eval: bool,
+    direct_eval_scopes: &[Span],
+) -> Result<Expr, CallExpr> {
     // callee must be a member expression ending in `.apply`
     let callee_member = match &call.callee {
         Callee::Expr(e) => match e.as_ref() {
@@ -118,6 +163,32 @@ fn try_convert_apply(call: CallExpr, unresolved_mark: Mark) -> Result<Expr, Call
         },
         _ => return Err(call),
     };
+
+    let is_reflect_apply = matches!(
+        callee_member.obj.as_ref(),
+        Expr::Ident(id) if id.sym.as_ref() == "Reflect"
+    ) && matches!(&callee_member.prop, MemberProp::Ident(id) if id.sym.as_ref() == "apply");
+
+    if is_reflect_apply && call.args.len() == 3 {
+        if !matches!(
+            callee_member.obj.as_ref(),
+            Expr::Ident(id) if is_unresolved_ident(id, "Reflect", unresolved_mark)
+        ) {
+            return Err(call);
+        }
+        if let Some(new_expr) = try_convert_reflect_apply(
+            &call,
+            callee_member,
+            unresolved_mark,
+            stable_bindings,
+            with_depth,
+            top_level_direct_eval,
+            direct_eval_scopes,
+        ) {
+            return Ok(new_expr);
+        }
+        return Err(call);
+    }
 
     // Check that the property is `apply`
     match &callee_member.prop {
@@ -179,6 +250,510 @@ fn try_convert_apply(call: CallExpr, unresolved_mark: Mark) -> Result<Expr, Call
     }
 
     Err(call)
+}
+
+fn try_convert_reflect_apply(
+    call: &CallExpr,
+    callee_member: &MemberExpr,
+    unresolved_mark: Mark,
+    stable_bindings: &HashSet<BindingId>,
+    with_depth: usize,
+    top_level_direct_eval: bool,
+    direct_eval_scopes: &[Span],
+) -> Option<Expr> {
+    if with_depth > 0
+        || top_level_direct_eval
+        || direct_eval_scopes
+            .iter()
+            .any(|scope| scope.lo <= call.span.lo && call.span.hi <= scope.hi)
+    {
+        return None;
+    }
+    if !matches!(
+        callee_member.obj.as_ref(),
+        Expr::Ident(id) if is_unresolved_ident(id, "Reflect", unresolved_mark)
+    ) || !matches!(&callee_member.prop, MemberProp::Ident(id) if id.sym.as_ref() == "apply")
+    {
+        return None;
+    }
+    if call.args.len() != 3 || call.args.iter().any(|arg| arg.spread.is_some()) {
+        return None;
+    }
+
+    let target_expr = call.args[0].expr.clone();
+    let target = strip_transparent_types(target_expr.as_ref());
+    let this_arg = strip_transparent_types(call.args[1].expr.as_ref());
+    let arguments = Box::new(strip_parens_owned((*call.args[2].expr).clone()));
+    let normalized_arguments = strip_transparent_types(arguments.as_ref());
+
+    if matches!(target, Expr::Ident(id) if id.sym.as_ref() == "eval") {
+        return None;
+    }
+
+    let output_arguments = if matches!(normalized_arguments, Expr::Array(_)) {
+        Box::new(normalized_arguments.clone())
+    } else {
+        arguments
+    };
+
+    match target_receiver(target) {
+        Some(receiver) => {
+            if !exprs_structurally_equal(this_arg, receiver)
+                || !receiver_is_stable(receiver, stable_bindings)
+            {
+                return None;
+            }
+        }
+        None if is_receiver_bearing_target(target) => {
+            if !matches!(target, Expr::SuperProp(_)) || !matches!(this_arg, Expr::This(_)) {
+                return None;
+            }
+        }
+        None => {
+            if !is_reflect_nullish(this_arg, unresolved_mark) {
+                return None;
+            }
+        }
+    }
+
+    Some(make_direct_spread_call(*target_expr, output_arguments))
+}
+
+fn is_reflect_nullish(expr: &Expr, unresolved_mark: Mark) -> bool {
+    is_unresolved_undefined(expr, unresolved_mark)
+        || matches!(expr, Expr::Lit(Lit::Null(_)))
+        || matches!(
+            expr,
+            Expr::Unary(UnaryExpr {
+                op: UnaryOp::Void,
+                arg,
+                ..
+            }) if matches!(strip_parens(arg), Expr::Lit(Lit::Num(number)) if number.value == 0.0)
+        )
+}
+
+fn target_receiver(target: &Expr) -> Option<&Expr> {
+    match target {
+        Expr::Member(member) => Some(strip_parens(member.obj.as_ref())),
+        Expr::OptChain(chain) => match chain.base.as_ref() {
+            OptChainBase::Member(member) => Some(strip_parens(member.obj.as_ref())),
+            OptChainBase::Call(_) => None,
+        },
+        _ => None,
+    }
+}
+
+fn is_receiver_bearing_target(target: &Expr) -> bool {
+    matches!(target, Expr::Member(_) | Expr::SuperProp(_))
+        || matches!(target, Expr::OptChain(chain) if matches!(
+            chain.base.as_ref(),
+            OptChainBase::Member(_)
+        ))
+}
+
+fn receiver_is_stable(expr: &Expr, stable_bindings: &HashSet<BindingId>) -> bool {
+    match expr {
+        Expr::This(_) => true,
+        Expr::Ident(id) => stable_bindings.contains(&(id.sym.clone(), id.ctxt)),
+        _ => false,
+    }
+}
+
+struct DirectEvalScopes {
+    top_level: bool,
+    functions: Vec<Span>,
+}
+
+#[derive(Default)]
+struct DirectEvalFinder {
+    found: bool,
+}
+
+impl Visit for DirectEvalFinder {
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        if is_direct_eval_call(call) {
+            self.found = true;
+            return;
+        }
+        call.visit_children_with(self);
+    }
+
+    fn visit_function(&mut self, _: &swc_core::ecma::ast::Function) {}
+
+    fn visit_arrow_expr(&mut self, _: &swc_core::ecma::ast::ArrowExpr) {}
+
+    fn visit_static_block(&mut self, _: &StaticBlock) {}
+
+    fn visit_constructor(&mut self, constructor: &Constructor) {
+        constructor.key.visit_with(self);
+    }
+
+    fn visit_getter_prop(&mut self, getter: &GetterProp) {
+        getter.key.visit_with(self);
+    }
+
+    fn visit_setter_prop(&mut self, setter: &SetterProp) {
+        setter.key.visit_with(self);
+    }
+
+    fn visit_class_prop(&mut self, prop: &ClassProp) {
+        prop.key.visit_with(self);
+        prop.decorators.visit_with(self);
+    }
+
+    fn visit_private_prop(&mut self, prop: &PrivateProp) {
+        prop.decorators.visit_with(self);
+    }
+
+    fn visit_auto_accessor(&mut self, accessor: &AutoAccessor) {
+        accessor.key.visit_with(self);
+        accessor.decorators.visit_with(self);
+    }
+
+    fn visit_pat(&mut self, pat: &Pat) {
+        match pat {
+            Pat::Ident(_) | Pat::Invalid(_) => {}
+            Pat::Array(array) => {
+                for elem in array.elems.iter().flatten() {
+                    elem.visit_with(self);
+                }
+            }
+            Pat::Object(object) => {
+                for prop in &object.props {
+                    match prop {
+                        ObjectPatProp::KeyValue(prop) => {
+                            prop.key.visit_with(self);
+                            prop.value.visit_with(self);
+                        }
+                        ObjectPatProp::Assign(prop) => prop.value.visit_with(self),
+                        ObjectPatProp::Rest(prop) => prop.arg.visit_with(self),
+                    }
+                }
+            }
+            Pat::Assign(assign) => {
+                assign.left.visit_with(self);
+                assign.right.visit_with(self);
+            }
+            Pat::Rest(rest) => rest.arg.visit_with(self),
+            Pat::Expr(expr) => expr.visit_with(self),
+        }
+    }
+
+    fn visit_prop_name(&mut self, prop: &PropName) {
+        if let PropName::Computed(prop) = prop {
+            prop.expr.visit_with(self);
+        }
+    }
+}
+
+struct DirectEvalScopeCollector {
+    functions: Vec<Span>,
+}
+
+impl Visit for DirectEvalScopeCollector {
+    fn visit_function(&mut self, function: &swc_core::ecma::ast::Function) {
+        let mut finder = DirectEvalFinder::default();
+        function.params.visit_with(&mut finder);
+        function.body.visit_with(&mut finder);
+        if finder.found {
+            self.functions.push(function.span);
+        }
+        function.visit_children_with(self);
+    }
+
+    fn visit_arrow_expr(&mut self, arrow: &swc_core::ecma::ast::ArrowExpr) {
+        let mut finder = DirectEvalFinder::default();
+        arrow.params.visit_with(&mut finder);
+        arrow.body.visit_with(&mut finder);
+        if finder.found {
+            self.functions.push(arrow.span);
+        }
+        arrow.visit_children_with(self);
+    }
+
+    fn visit_static_block(&mut self, block: &StaticBlock) {
+        let mut finder = DirectEvalFinder::default();
+        block.body.stmts.visit_with(&mut finder);
+        if finder.found {
+            self.functions.push(block.span);
+        }
+        block.visit_children_with(self);
+    }
+
+    fn visit_constructor(&mut self, constructor: &Constructor) {
+        let mut finder = DirectEvalFinder::default();
+        constructor.params.visit_with(&mut finder);
+        if let Some(body) = &constructor.body {
+            body.visit_with(&mut finder);
+        }
+        if finder.found {
+            self.functions.push(constructor.span);
+        }
+        constructor.visit_children_with(self);
+    }
+
+    fn visit_getter_prop(&mut self, getter: &GetterProp) {
+        let mut finder = DirectEvalFinder::default();
+        getter.function.body.visit_with(&mut finder);
+        if finder.found {
+            self.functions.push(getter.function.span);
+        }
+        getter.visit_children_with(self);
+    }
+
+    fn visit_setter_prop(&mut self, setter: &SetterProp) {
+        let mut finder = DirectEvalFinder::default();
+        setter.function.body.visit_with(&mut finder);
+        if finder.found {
+            self.functions.push(setter.function.span);
+        }
+        setter.visit_children_with(self);
+    }
+
+    fn visit_class_prop(&mut self, prop: &ClassProp) {
+        let mut finder = DirectEvalFinder::default();
+        if let Some(value) = &prop.value {
+            value.visit_with(&mut finder);
+            if finder.found {
+                self.functions.push(value.span());
+            }
+        }
+        prop.visit_children_with(self);
+    }
+
+    fn visit_private_prop(&mut self, prop: &PrivateProp) {
+        let mut finder = DirectEvalFinder::default();
+        if let Some(value) = &prop.value {
+            value.visit_with(&mut finder);
+            if finder.found {
+                self.functions.push(value.span());
+            }
+        }
+        prop.visit_children_with(self);
+    }
+
+    fn visit_auto_accessor(&mut self, accessor: &AutoAccessor) {
+        let mut finder = DirectEvalFinder::default();
+        if let Some(value) = &accessor.value {
+            value.visit_with(&mut finder);
+            if finder.found {
+                self.functions.push(value.span());
+            }
+        }
+        accessor.visit_children_with(self);
+    }
+}
+
+fn collect_direct_eval_scopes(module: &Module) -> DirectEvalScopes {
+    let mut top_level_finder = DirectEvalFinder::default();
+    module.visit_with(&mut top_level_finder);
+
+    let mut collector = DirectEvalScopeCollector {
+        functions: Vec::new(),
+    };
+    module.visit_with(&mut collector);
+
+    DirectEvalScopes {
+        top_level: top_level_finder.found,
+        functions: collector.functions,
+    }
+}
+
+fn collect_stable_bindings(module: &Module) -> HashSet<BindingId> {
+    let mut collector = StableBindingCollector {
+        const_bindings: HashSet::new(),
+        writes: HashSet::new(),
+    };
+    module.visit_with(&mut collector);
+    collector
+        .const_bindings
+        .difference(&collector.writes)
+        .cloned()
+        .collect()
+}
+
+struct StableBindingCollector {
+    const_bindings: HashSet<BindingId>,
+    writes: HashSet<BindingId>,
+}
+
+impl Visit for StableBindingCollector {
+    fn visit_import_decl(&mut self, decl: &ImportDecl) {
+        for specifier in &decl.specifiers {
+            if let ImportSpecifier::Namespace(specifier) = specifier {
+                self.const_bindings
+                    .insert((specifier.local.sym.clone(), specifier.local.ctxt));
+            }
+        }
+    }
+
+    fn visit_var_decl(&mut self, decl: &swc_core::ecma::ast::VarDecl) {
+        if decl.kind == VarDeclKind::Const {
+            for item in &decl.decls {
+                collect_const_pattern_ids(&item.name, &mut self.const_bindings);
+                if let Some(init) = &item.init {
+                    init.visit_with(self);
+                }
+            }
+        } else {
+            decl.visit_children_with(self);
+        }
+    }
+
+    fn visit_assign_expr(&mut self, expr: &swc_core::ecma::ast::AssignExpr) {
+        collect_assign_target_ids(&expr.left, &mut self.writes);
+        expr.visit_children_with(self);
+    }
+
+    fn visit_update_expr(&mut self, expr: &UpdateExpr) {
+        collect_assignment_expr_ids(expr.arg.as_ref(), &mut self.writes);
+        expr.visit_children_with(self);
+    }
+
+    fn visit_for_in_stmt(&mut self, stmt: &swc_core::ecma::ast::ForInStmt) {
+        collect_for_head_assignment_ids(&stmt.left, &mut self.writes);
+        stmt.visit_children_with(self);
+    }
+
+    fn visit_for_of_stmt(&mut self, stmt: &swc_core::ecma::ast::ForOfStmt) {
+        collect_for_head_assignment_ids(&stmt.left, &mut self.writes);
+        stmt.visit_children_with(self);
+    }
+}
+
+fn collect_const_pattern_ids(pat: &Pat, out: &mut HashSet<BindingId>) {
+    match pat {
+        Pat::Ident(binding) => {
+            out.insert((binding.id.sym.clone(), binding.id.ctxt));
+        }
+        Pat::Array(array) => {
+            for elem in array.elems.iter().flatten() {
+                collect_const_pattern_ids(elem, out);
+            }
+        }
+        Pat::Object(object) => {
+            for prop in &object.props {
+                match prop {
+                    ObjectPatProp::KeyValue(prop) => {
+                        collect_const_pattern_ids(&prop.value, out);
+                    }
+                    ObjectPatProp::Assign(prop) => {
+                        out.insert((prop.key.sym.clone(), prop.key.ctxt));
+                    }
+                    ObjectPatProp::Rest(prop) => {
+                        collect_const_pattern_ids(&prop.arg, out);
+                    }
+                }
+            }
+        }
+        Pat::Assign(assign) => collect_const_pattern_ids(&assign.left, out),
+        Pat::Rest(rest) => collect_const_pattern_ids(&rest.arg, out),
+        Pat::Expr(_) | Pat::Invalid(_) => {}
+    }
+}
+
+fn collect_assign_target_ids(target: &AssignTarget, out: &mut HashSet<BindingId>) {
+    match target {
+        AssignTarget::Simple(simple) => collect_simple_assign_target_ids(simple, out),
+        AssignTarget::Pat(pat) => collect_assign_target_pat_ids(pat, out),
+    }
+}
+
+fn collect_simple_assign_target_ids(target: &SimpleAssignTarget, out: &mut HashSet<BindingId>) {
+    match target {
+        SimpleAssignTarget::Ident(binding) => {
+            out.insert((binding.id.sym.clone(), binding.id.ctxt));
+        }
+        SimpleAssignTarget::Paren(paren) => collect_assignment_expr_ids(&paren.expr, out),
+        SimpleAssignTarget::TsAs(expr) => collect_assignment_expr_ids(&expr.expr, out),
+        SimpleAssignTarget::TsSatisfies(expr) => collect_assignment_expr_ids(&expr.expr, out),
+        SimpleAssignTarget::TsNonNull(expr) => collect_assignment_expr_ids(&expr.expr, out),
+        SimpleAssignTarget::TsTypeAssertion(expr) => collect_assignment_expr_ids(&expr.expr, out),
+        SimpleAssignTarget::TsInstantiation(expr) => collect_assignment_expr_ids(&expr.expr, out),
+        SimpleAssignTarget::Member(_)
+        | SimpleAssignTarget::SuperProp(_)
+        | SimpleAssignTarget::OptChain(_)
+        | SimpleAssignTarget::Invalid(_) => {}
+    }
+}
+
+fn collect_assignment_expr_ids(expr: &Expr, out: &mut HashSet<BindingId>) {
+    match expr {
+        Expr::Ident(id) => {
+            out.insert((id.sym.clone(), id.ctxt));
+        }
+        Expr::Paren(paren) => collect_assignment_expr_ids(&paren.expr, out),
+        Expr::TsAs(expr) => collect_assignment_expr_ids(&expr.expr, out),
+        Expr::TsSatisfies(expr) => collect_assignment_expr_ids(&expr.expr, out),
+        Expr::TsNonNull(expr) => collect_assignment_expr_ids(&expr.expr, out),
+        Expr::TsTypeAssertion(expr) => collect_assignment_expr_ids(&expr.expr, out),
+        Expr::TsInstantiation(expr) => collect_assignment_expr_ids(&expr.expr, out),
+        _ => {}
+    }
+}
+
+fn collect_assign_target_pat_ids(pat: &AssignTargetPat, out: &mut HashSet<BindingId>) {
+    match pat {
+        AssignTargetPat::Array(array) => {
+            for elem in array.elems.iter().flatten() {
+                collect_assignment_pat_ids(elem, out);
+            }
+        }
+        AssignTargetPat::Object(object) => {
+            for prop in &object.props {
+                match prop {
+                    ObjectPatProp::KeyValue(prop) => {
+                        collect_assignment_pat_ids(&prop.value, out);
+                    }
+                    ObjectPatProp::Assign(prop) => {
+                        out.insert((prop.key.sym.clone(), prop.key.ctxt));
+                    }
+                    ObjectPatProp::Rest(prop) => {
+                        collect_assignment_pat_ids(&prop.arg, out);
+                    }
+                }
+            }
+        }
+        AssignTargetPat::Invalid(_) => {}
+    }
+}
+
+fn collect_assignment_pat_ids(pat: &Pat, out: &mut HashSet<BindingId>) {
+    match pat {
+        Pat::Ident(binding) => {
+            out.insert((binding.id.sym.clone(), binding.id.ctxt));
+        }
+        Pat::Array(array) => {
+            for elem in array.elems.iter().flatten() {
+                collect_assignment_pat_ids(elem, out);
+            }
+        }
+        Pat::Object(object) => {
+            for prop in &object.props {
+                match prop {
+                    ObjectPatProp::KeyValue(prop) => {
+                        collect_assignment_pat_ids(&prop.value, out);
+                    }
+                    ObjectPatProp::Assign(prop) => {
+                        out.insert((prop.key.sym.clone(), prop.key.ctxt));
+                    }
+                    ObjectPatProp::Rest(prop) => {
+                        collect_assignment_pat_ids(&prop.arg, out);
+                    }
+                }
+            }
+        }
+        Pat::Assign(assign) => collect_assignment_pat_ids(&assign.left, out),
+        Pat::Rest(rest) => collect_assignment_pat_ids(&rest.arg, out),
+        Pat::Expr(expr) => collect_assignment_expr_ids(expr, out),
+        Pat::Invalid(_) => {}
+    }
+}
+
+fn collect_for_head_assignment_ids(head: &ForHead, out: &mut HashSet<BindingId>) {
+    if let ForHead::Pat(pat) = head {
+        collect_assignment_pat_ids(pat, out);
+    }
 }
 
 fn try_convert_split_memoized_apply(
@@ -325,13 +900,33 @@ fn make_spread_call(call: CallExpr) -> Expr {
     // second arg becomes the spread argument
     let second_arg = args.remove(1).expr;
 
+    make_direct_spread_call_with_parts(span, ctxt, fn_expr, second_arg, type_args)
+}
+
+fn make_direct_spread_call(callee: Expr, arguments: Box<Expr>) -> Expr {
+    make_direct_spread_call_with_parts(
+        DUMMY_SP,
+        swc_core::common::SyntaxContext::empty(),
+        Box::new(callee),
+        arguments,
+        None,
+    )
+}
+
+fn make_direct_spread_call_with_parts(
+    span: swc_core::common::Span,
+    ctxt: swc_core::common::SyntaxContext,
+    callee: Box<Expr>,
+    arguments: Box<Expr>,
+    type_args: Option<Box<swc_core::ecma::ast::TsTypeParamInstantiation>>,
+) -> Expr {
     Expr::Call(CallExpr {
         span,
         ctxt,
-        callee: Callee::Expr(fn_expr),
+        callee: Callee::Expr(callee),
         args: vec![ExprOrSpread {
             spread: Some(DUMMY_SP),
-            expr: second_arg,
+            expr: arguments,
         }],
         type_args,
     })
