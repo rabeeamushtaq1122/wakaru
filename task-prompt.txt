@@ -2,7 +2,7 @@ Title: Harden named require recovery against unsafe CommonJS boundaries
 
 Improve named-member recovery for top-level CommonJS imports without changing runtime behavior.
 
-When converting a top-level binding such as `var UIBase = require("./dep.js").UIBase` into a named import, recover it only when the property name is a valid JavaScript identifier and the same provider member is not mutated anywhere in the module. Treat assignments, compound assignments, updates, deletes, and for-in/for-of assignment heads as mutations.
+When converting a top-level binding such as `var UIBase = require("./dep.js").UIBase` into a named import, recover it only when the property name is a valid JavaScript identifier and the binding's recovered value cannot be invalidated by a provider-member mutation. Treat assignments, compound assignments, updates, deletes, and for-in/for-of assignment heads as mutations. An earlier proven binding may remain recoverable when a later provider mutation is preserved as CommonJS code rather than folded into the import.
 
 Preserve the original CommonJS form when the provider member can change, when the property name cannot be represented as an identifier, or when the candidate is an early read from the current module's own CommonJS export surface. In particular, do not partially cross the CommonJS boundary for a self-module read that occurs before its exported member is initialized.
 
