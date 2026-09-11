@@ -21,6 +21,19 @@ consume(require("./dep.js")["a²"]);
 }
 
 #[test]
+fn preserves_named_require_when_require_is_shadowed() {
+    let input = r#"
+var require = customRequire;
+var UIBase = require("./dep.js").UIBase;
+consume(UIBase);
+"#;
+    let output = apply(input);
+
+    assert!(!output.contains("import { UIBase }"));
+    assert!(output.contains("require(\"./dep.js\").UIBase"));
+}
+
+#[test]
 fn preserves_named_require_when_provider_member_is_mutated() {
     let mutations = [
         r#"require("./dep.js").UIBase = replacement;"#,

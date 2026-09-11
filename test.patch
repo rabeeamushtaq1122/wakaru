@@ -1,9 +1,9 @@
 diff --git a/crates/core/tests/un_esm_rule_8c4d2e.rs b/crates/core/tests/un_esm_rule_8c4d2e.rs
 new file mode 100644
-index 00000000..6a582ed6
+index 00000000..91cd950f
 --- /dev/null
 +++ b/crates/core/tests/un_esm_rule_8c4d2e.rs
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,86 @@
 +mod common;
 +
 +use common::{assert_eq_normalized, render_pipeline_until, render_pipeline_until_with_filename};
@@ -24,6 +24,19 @@ index 00000000..6a582ed6
 +"#;
 +
 +    assert_eq_normalized(&apply(input), expected);
++}
++
++#[test]
++fn preserves_named_require_when_require_is_shadowed() {
++    let input = r#"
++var require = customRequire;
++var UIBase = require("./dep.js").UIBase;
++consume(UIBase);
++"#;
++    let output = apply(input);
++
++    assert!(!output.contains("import { UIBase }"));
++    assert!(output.contains("require(\"./dep.js\").UIBase"));
 +}
 +
 +#[test]
