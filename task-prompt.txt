@@ -1,0 +1,5 @@
+Title: Require canonical awaiter wrapper frames before unwrapping
+
+Fix async/await recovery so an awaiter wrapper is removed only when its call has the canonical compiler-generated frame. The wrapper call must have exactly four non-spread arguments: the receiver value, the arguments slot, the Promise constructor slot, and a parameterless generator function.
+
+Accept receiver values including this, a void expression whose operand is a literal, the unresolved global undefined, and a resolver-proven local alias. In the arguments slot, accept only a void expression whose operand is a literal or the unresolved global undefined. Accept only the unresolved global Promise or undefined, or a void expression whose operand is a literal, in the Promise constructor slot.
