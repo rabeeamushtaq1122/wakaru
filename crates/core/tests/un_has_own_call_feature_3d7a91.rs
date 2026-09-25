@@ -1,10 +1,10 @@
 mod common;
 
-use common::{assert_eq_normalized, render_pipeline_until_with_level};
+use common::{assert_eq_normalized, render_with_level};
 use wakaru_core::RewriteLevel;
 
 fn apply(source: &str, level: RewriteLevel) -> String {
-    render_pipeline_until_with_level(source, "UnSpreadArrayLiteral", level)
+    render_with_level(source, level)
 }
 
 #[test]
