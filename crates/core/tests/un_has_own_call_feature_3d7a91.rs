@@ -117,8 +117,12 @@ fn assignment_update_and_delete_are_all_barriers() {
         r#"
 Object = otherObject;
 const a = Object.prototype.hasOwnProperty.call(value, key);
+Object.prototype = otherPrototype;
+const prototypeReplaced = Object.prototype.hasOwnProperty.call(value, key);
 delete Object.prototype.hasOwnProperty;
 const b = Object.prototype.hasOwnProperty.call(value, key);
+delete Object.prototype;
+const prototypeDeleted = Object.prototype.hasOwnProperty.call(value, key);
 Object.prototype.hasOwnProperty++;
 const c = Object.prototype.hasOwnProperty.call(value, key);
 "#,
@@ -129,8 +133,12 @@ const c = Object.prototype.hasOwnProperty.call(value, key);
         r#"
 Object = otherObject;
 const a = Object.prototype.hasOwnProperty.call(value, key);
+Object.prototype = otherPrototype;
+const prototypeReplaced = Object.prototype.hasOwnProperty.call(value, key);
 delete Object.prototype.hasOwnProperty;
 const b = Object.prototype.hasOwnProperty.call(value, key);
+delete Object.prototype;
+const prototypeDeleted = Object.prototype.hasOwnProperty.call(value, key);
 Object.prototype.hasOwnProperty++;
 const c = Object.prototype.hasOwnProperty.call(value, key);
 "#,
@@ -141,6 +149,18 @@ const c = Object.prototype.hasOwnProperty.call(value, key);
             RewriteLevel::Aggressive,
         ),
         "const safe = Object.hasOwn(value, key);",
+    );
+}
+
+#[test]
+fn preserves_existing_indirect_call_rewrites() {
+    let actual = apply(
+        "const direct = (0, fn)(value); const wrapped = Object(fn)(value);",
+        RewriteLevel::Standard,
+    );
+    assert_eq_normalized(
+        &actual,
+        "const direct = fn(value); const wrapped = fn(value);",
     );
 }
 
