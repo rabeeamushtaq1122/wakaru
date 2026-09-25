@@ -153,6 +153,77 @@ const c = Object.prototype.hasOwnProperty.call(value, key);
 }
 
 #[test]
+fn aliases_to_object_and_prototype_are_mutation_barriers() {
+    let actual = apply(
+        r#"
+const before = Object.prototype.hasOwnProperty.call(value, key);
+Object.prototype.hasOwnProperty = replacement;
+const after = Object.prototype.hasOwnProperty.call(value, key);
+"#,
+        RewriteLevel::Aggressive,
+    );
+    assert_eq_normalized(
+        &actual,
+        r#"
+const before = Object.prototype.hasOwnProperty.call(value, key);
+Object.prototype.hasOwnProperty = replacement;
+const after = Object.prototype.hasOwnProperty.call(value, key);
+"#,
+    );
+    assert_eq_normalized(
+        &apply(
+            "const safe = Object.prototype.hasOwnProperty.call(value, key);",
+            RewriteLevel::Aggressive,
+        ),
+        "const safe = Object.hasOwn(value, key);",
+    );
+}
+
+#[test]
+fn dynamic_scope_blocks_recovery_conservatively() {
+    let actual = apply(
+        r#"
+with (scope) { consume(Object.prototype.hasOwnProperty.call(value, key)); }
+const afterWith = Object.prototype.hasOwnProperty.call(value, key);
+"#,
+        RewriteLevel::Aggressive,
+    );
+    assert_eq_normalized(
+        &actual,
+        r#"
+with (scope) { consume(Object.prototype.hasOwnProperty.call(value, key)); }
+const afterWith = Object.prototype.hasOwnProperty.call(value, key);
+"#,
+    );
+    assert_eq_normalized(
+        &apply(
+            "const safe = Object.prototype.hasOwnProperty.call(value, key);",
+            RewriteLevel::Aggressive,
+        ),
+        "const safe = Object.hasOwn(value, key);",
+    );
+}
+
+#[test]
+fn direct_eval_blocks_recovery_conservatively() {
+    let actual = apply(
+        "eval(code); const value = Object.prototype.hasOwnProperty.call(object, key);",
+        RewriteLevel::Aggressive,
+    );
+    assert_eq_normalized(
+        &actual,
+        "eval(code); const value = Object.prototype.hasOwnProperty.call(object, key);",
+    );
+    assert_eq_normalized(
+        &apply(
+            "const safe = Object.prototype.hasOwnProperty.call(value, key);",
+            RewriteLevel::Aggressive,
+        ),
+        "const safe = Object.hasOwn(value, key);",
+    );
+}
+
+#[test]
 fn preserves_existing_indirect_call_rewrites() {
     let actual = apply(
         "const direct = (0, fn)(value); const wrapped = Object(fn)(value);",

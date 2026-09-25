@@ -1,7 +1,9 @@
+use std::collections::HashSet;
+
 use swc_core::common::{Mark, DUMMY_SP};
 use swc_core::ecma::ast::{
-    AssignExpr, CallExpr, Callee, Expr, Ident, IdentName, MemberExpr, MemberProp, Module,
-    UnaryExpr, UnaryOp, UpdateExpr,
+    AssignExpr, CallExpr, Callee, Expr, Id, Ident, IdentName, MemberExpr, MemberProp, Module, Pat,
+    UnaryExpr, UnaryOp, UpdateExpr, VarDeclarator, WithStmt,
 };
 use swc_core::ecma::utils::ExprFactory;
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
@@ -88,6 +90,8 @@ struct HasOwnMutationCollector {
     mark: Mark,
     write_depth: usize,
     blocked: bool,
+    object_aliases: HashSet<Id>,
+    prototype_aliases: HashSet<Id>,
 }
 
 impl HasOwnMutationCollector {
@@ -96,13 +100,20 @@ impl HasOwnMutationCollector {
             mark,
             write_depth: 0,
             blocked: false,
+            object_aliases: HashSet::new(),
+            prototype_aliases: HashSet::new(),
         };
         module.visit_with(&mut collector);
         collector.blocked
     }
 
     fn is_object(&self, expr: &Expr) -> bool {
-        matches!(expr, Expr::Ident(id) if id.sym.as_ref() == "Object" && id.ctxt.outer() == self.mark)
+        matches!(expr, Expr::Ident(id) if (id.sym.as_ref() == "Object" && id.ctxt.outer() == self.mark) || self.object_aliases.contains(&id.to_id()))
+    }
+
+    fn is_prototype(&self, expr: &Expr) -> bool {
+        matches!(expr, Expr::Ident(id) if self.prototype_aliases.contains(&id.to_id()))
+            || matches!(expr, Expr::Member(member) if matches!(&member.prop, MemberProp::Ident(prop) if prop.sym.as_ref() == "prototype") && self.is_object(member.obj.as_ref()))
     }
 
     fn is_target(&self, member: &MemberExpr) -> bool {
@@ -111,6 +122,9 @@ impl HasOwnMutationCollector {
         };
         if self.is_object(member.obj.as_ref()) {
             return prop.sym.as_ref() == "prototype";
+        }
+        if self.is_prototype(member.obj.as_ref()) {
+            return prop.sym.as_ref() == "hasOwnProperty" || prop.sym.as_ref() == "hasOwn";
         }
         let Expr::Member(parent) = member.obj.as_ref() else {
             return false;
@@ -125,6 +139,34 @@ impl HasOwnMutationCollector {
 }
 
 impl Visit for HasOwnMutationCollector {
+    fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
+        if let (Pat::Ident(binding), Some(init)) = (&declarator.name, &declarator.init) {
+            if let Expr::Ident(id) = init.as_ref() {
+                if id.sym.as_ref() == "Object" && id.ctxt.outer() == self.mark {
+                    self.object_aliases.insert(binding.id.to_id());
+                }
+            } else if self.is_prototype(init.as_ref()) {
+                self.prototype_aliases.insert(binding.id.to_id());
+            }
+        }
+        declarator.visit_children_with(self);
+    }
+
+    fn visit_with_stmt(&mut self, stmt: &WithStmt) {
+        self.blocked = true;
+        stmt.visit_children_with(self);
+    }
+
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        if let Callee::Expr(callee) = &call.callee {
+            if matches!(callee.as_ref(), Expr::Ident(id) if id.sym.as_ref() == "eval" && id.ctxt.outer() == self.mark)
+            {
+                self.blocked = true;
+            }
+        }
+        call.visit_children_with(self);
+    }
+
     fn visit_ident(&mut self, ident: &Ident) {
         if self.write_depth > 0 && ident.sym.as_ref() == "Object" && ident.ctxt.outer() == self.mark
         {
