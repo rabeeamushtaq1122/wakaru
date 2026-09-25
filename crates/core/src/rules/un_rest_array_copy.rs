@@ -1,9 +1,9 @@
 use swc_core::atoms::Atom;
 use swc_core::common::Mark;
 use swc_core::ecma::ast::{
-    ArrowExpr, AssignOp, AssignTarget, BindingIdent, Callee, Expr, Function, FunctionBody, Ident,
-    MemberProp, ObjectPatProp, Pat, SimpleAssignTarget, Stmt, UpdateOp, VarDeclOrExpr,
-    VarDeclarator,
+    ArrowExpr, AssignOp, AssignTarget, BindingIdent, Callee, CatchClause, ClassDecl, ClassExpr,
+    Constructor, Expr, FnDecl, FnExpr, Function, FunctionBody, Ident, MemberProp, ObjectPatProp,
+    Pat, SimpleAssignTarget, Stmt, UpdateOp, VarDeclOrExpr, VarDeclarator,
 };
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
@@ -359,14 +359,94 @@ impl Visit for EscapeChecker {
         let rebinds = func
             .params
             .iter()
-            .any(|p| pat_binds_sym(&p.pat, &self.to_sym));
+            .any(|p| pat_binds_sym(&p.pat, &self.to_sym))
+            || func
+                .body
+                .as_ref()
+                .is_some_and(|body| function_body_binds_sym(body, &self.to_sym));
         self.with_scope(rebinds, |s| func.visit_children_with(s));
     }
 
     fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
-        let rebinds = arrow.params.iter().any(|p| pat_binds_sym(p, &self.to_sym));
+        let rebinds = arrow.params.iter().any(|p| pat_binds_sym(p, &self.to_sym))
+            || match arrow.body.as_ref() {
+                swc_core::ecma::ast::ArrowFunctionBody::FunctionBody(body) => {
+                    function_body_binds_sym(body, &self.to_sym)
+                }
+                swc_core::ecma::ast::ArrowFunctionBody::Expr(_) => false,
+            };
         self.with_scope(rebinds, |s| arrow.visit_children_with(s));
     }
+
+    fn visit_constructor(&mut self, constructor: &Constructor) {
+        let rebinds = constructor.params.iter().any(|param| match param {
+            swc_core::ecma::ast::ParamOrTsParamProp::Param(param) => {
+                pat_binds_sym(&param.pat, &self.to_sym)
+            }
+            swc_core::ecma::ast::ParamOrTsParamProp::TsParamProp(_) => false,
+        }) || constructor
+            .body
+            .as_ref()
+            .is_some_and(|body| function_body_binds_sym(body, &self.to_sym));
+        self.with_scope(rebinds, |s| constructor.visit_children_with(s));
+    }
+
+    fn visit_fn_expr(&mut self, expr: &FnExpr) {
+        let rebinds = expr
+            .ident
+            .as_ref()
+            .is_some_and(|ident| ident.sym == self.to_sym);
+        self.with_scope(rebinds, |s| expr.visit_children_with(s));
+    }
+
+    fn visit_class_expr(&mut self, expr: &ClassExpr) {
+        let rebinds = expr
+            .ident
+            .as_ref()
+            .is_some_and(|ident| ident.sym == self.to_sym);
+        self.with_scope(rebinds, |s| expr.visit_children_with(s));
+    }
+
+    fn visit_block_stmt(&mut self, block: &swc_core::ecma::ast::BlockStmt) {
+        let rebinds = block_binds_sym(block, &self.to_sym);
+        self.with_scope(rebinds, |s| block.visit_children_with(s));
+    }
+
+    fn visit_catch_clause(&mut self, catch: &CatchClause) {
+        let rebinds = catch
+            .param
+            .as_ref()
+            .is_some_and(|param| pat_binds_sym(param, &self.to_sym));
+        self.with_scope(rebinds, |s| catch.visit_children_with(s));
+    }
+}
+
+fn function_body_binds_sym(body: &FunctionBody, sym: &Atom) -> bool {
+    body.stmts.iter().any(|stmt| match stmt {
+        Stmt::Decl(swc_core::ecma::ast::Decl::Var(var)) => {
+            var.decls.iter().any(|decl| pat_binds_sym(&decl.name, sym))
+        }
+        Stmt::Decl(swc_core::ecma::ast::Decl::Fn(FnDecl { ident, .. }))
+        | Stmt::Decl(swc_core::ecma::ast::Decl::Class(ClassDecl { ident, .. })) => {
+            ident.sym == *sym
+        }
+        _ => false,
+    })
+}
+
+fn block_binds_sym(block: &swc_core::ecma::ast::BlockStmt, sym: &Atom) -> bool {
+    block.stmts.iter().any(|stmt| match stmt {
+        Stmt::Decl(swc_core::ecma::ast::Decl::Var(var))
+            if var.kind != swc_core::ecma::ast::VarDeclKind::Var =>
+        {
+            var.decls.iter().any(|decl| pat_binds_sym(&decl.name, sym))
+        }
+        Stmt::Decl(swc_core::ecma::ast::Decl::Fn(FnDecl { ident, .. }))
+        | Stmt::Decl(swc_core::ecma::ast::Decl::Class(ClassDecl { ident, .. })) => {
+            ident.sym == *sym
+        }
+        _ => false,
+    })
 }
 
 /// True if `pat` introduces a binding named `sym` (including rest, assign, nested).
@@ -408,6 +488,10 @@ impl VisitMut for IdentReplacer {
             .params
             .iter()
             .any(|p| pat_binds_sym(&p.pat, &self.to.0))
+            || func
+                .body
+                .as_ref()
+                .is_some_and(|body| function_body_binds_sym(body, &self.to.0))
         {
             return; // to is rebound — inner references resolve to a different binding
         }
@@ -415,9 +499,72 @@ impl VisitMut for IdentReplacer {
     }
 
     fn visit_mut_arrow_expr(&mut self, arrow: &mut ArrowExpr) {
-        if arrow.params.iter().any(|p| pat_binds_sym(p, &self.to.0)) {
+        if arrow.params.iter().any(|p| pat_binds_sym(p, &self.to.0))
+            || match arrow.body.as_ref() {
+                swc_core::ecma::ast::ArrowFunctionBody::FunctionBody(body) => {
+                    function_body_binds_sym(body, &self.to.0)
+                }
+                swc_core::ecma::ast::ArrowFunctionBody::Expr(_) => false,
+            }
+        {
             return;
         }
         arrow.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_constructor(&mut self, constructor: &mut Constructor) {
+        if constructor.params.iter().any(|param| match param {
+            swc_core::ecma::ast::ParamOrTsParamProp::Param(param) => {
+                pat_binds_sym(&param.pat, &self.to.0)
+            }
+            swc_core::ecma::ast::ParamOrTsParamProp::TsParamProp(_) => false,
+        }) || constructor
+            .body
+            .as_ref()
+            .is_some_and(|body| function_body_binds_sym(body, &self.to.0))
+        {
+            return;
+        }
+        constructor.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_fn_expr(&mut self, expr: &mut FnExpr) {
+        if expr
+            .ident
+            .as_ref()
+            .is_some_and(|ident| ident.sym == self.to.0)
+        {
+            return;
+        }
+        expr.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_class_expr(&mut self, expr: &mut ClassExpr) {
+        if expr
+            .ident
+            .as_ref()
+            .is_some_and(|ident| ident.sym == self.to.0)
+        {
+            return;
+        }
+        expr.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_block_stmt(&mut self, block: &mut swc_core::ecma::ast::BlockStmt) {
+        if block_binds_sym(block, &self.to.0) {
+            return;
+        }
+        block.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_catch_clause(&mut self, catch: &mut CatchClause) {
+        if catch
+            .param
+            .as_ref()
+            .is_some_and(|param| pat_binds_sym(param, &self.to.0))
+        {
+            return;
+        }
+        catch.visit_mut_children_with(self);
     }
 }
