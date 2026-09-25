@@ -88,9 +88,13 @@ const optional = Object?.prototype.hasOwnProperty.call(value, key);
 fn any_static_mutation_blocks_earlier_and_later_calls() {
     let actual = apply(
         r#"
+const O = Object;
+const P = Object.prototype;
 const before = Object.prototype.hasOwnProperty.call(value, key);
-Object.prototype.hasOwnProperty = replacement;
+O.prototype.hasOwnProperty = replacement;
 const after = Object.prototype.hasOwnProperty.call(value, key);
+delete P.hasOwnProperty;
+const later = Object.prototype.hasOwnProperty.call(value, key);
 "#,
         RewriteLevel::Aggressive,
     );
@@ -100,6 +104,8 @@ const after = Object.prototype.hasOwnProperty.call(value, key);
 const before = Object.prototype.hasOwnProperty.call(value, key);
 Object.prototype.hasOwnProperty = replacement;
 const after = Object.prototype.hasOwnProperty.call(value, key);
+delete Object.prototype.hasOwnProperty;
+const later = Object.prototype.hasOwnProperty.call(value, key);
 "#,
     );
     assert_eq_normalized(
