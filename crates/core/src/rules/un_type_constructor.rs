@@ -1,12 +1,15 @@
+use std::collections::HashSet;
 use swc_core::common::{Mark, Span, Spanned, SyntaxContext, DUMMY_SP};
+
 use swc_core::ecma::ast::{
-    ArrayLit, BinExpr, BinaryOp, CallExpr, Expr, ExprOrSpread, Ident, Lit, Number, Str, UnaryExpr,
-    UnaryOp,
+    ArrayLit, ArrowExpr, BinExpr, BinaryOp, CallExpr, Class, ClassExpr, Constructor, Expr,
+    ExprOrSpread, FnExpr, Function, Ident, Lit, Module, Number, Str, UnaryExpr, UnaryOp,
 };
 use swc_core::ecma::utils::ExprFactory;
-use swc_core::ecma::visit::{VisitMut, VisitMutWith};
+use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 use super::RewriteLevel;
+use crate::rules::eval_utils::module_blocks_global_reference;
 
 pub struct UnTypeConstructor {
     level: RewriteLevel,
@@ -14,6 +17,7 @@ pub struct UnTypeConstructor {
     /// they name the globals, so they carry the unresolved mark like any other
     /// generated global reference.
     unresolved_ctxt: SyntaxContext,
+    blocked_scopes: Vec<HashSet<String>>,
 }
 
 impl UnTypeConstructor {
@@ -21,11 +25,74 @@ impl UnTypeConstructor {
         Self {
             level,
             unresolved_ctxt: SyntaxContext::empty().apply_mark(unresolved_mark),
+            blocked_scopes: Vec::new(),
         }
+    }
+
+    fn blocked(&self, name: &str) -> bool {
+        self.blocked_scopes.iter().any(|scope| scope.contains(name))
+    }
+
+    fn with_scope(&mut self, names: HashSet<String>, visit: impl FnOnce(&mut Self)) {
+        self.blocked_scopes.push(names);
+        visit(self);
+        self.blocked_scopes.pop();
+    }
+
+    fn can_synthesize(&self, name: &str) -> bool {
+        !self.blocked(name)
     }
 }
 
 impl VisitMut for UnTypeConstructor {
+    fn visit_mut_module(&mut self, module: &mut Module) {
+        if self.level < RewriteLevel::Aggressive {
+            return;
+        }
+        // A module-wide dynamic scope can introduce any of the names at
+        // runtime. Statically declared names are handled per lexical scope
+        // below, so unrelated top-level recoveries remain usable.
+        if ["Number", "String", "Array"]
+            .iter()
+            .any(|name| module_blocks_global_reference(module, name))
+        {
+            return;
+        }
+        let names = module_scope_names(module);
+        self.with_scope(names, |this| module.visit_mut_children_with(this));
+    }
+
+    fn visit_mut_function(&mut self, function: &mut Function) {
+        let names = function_scope_names(function);
+        self.with_scope(names, |this| function.visit_mut_children_with(this));
+    }
+
+    fn visit_mut_arrow_expr(&mut self, arrow: &mut ArrowExpr) {
+        let names = arrow_scope_names(arrow);
+        self.with_scope(names, |this| arrow.visit_mut_children_with(this));
+    }
+
+    fn visit_mut_fn_expr(&mut self, expression: &mut FnExpr) {
+        let mut names = HashSet::new();
+        if let Some(ident) = &expression.ident {
+            names.insert(ident.sym.to_string());
+        }
+        self.with_scope(names, |this| expression.visit_mut_children_with(this));
+    }
+
+    fn visit_mut_class_expr(&mut self, expression: &mut ClassExpr) {
+        let mut names = HashSet::new();
+        if let Some(ident) = &expression.ident {
+            names.insert(ident.sym.to_string());
+        }
+        self.with_scope(names, |this| expression.visit_mut_children_with(this));
+    }
+
+    fn visit_mut_constructor(&mut self, constructor: &mut Constructor) {
+        let names = constructor_scope_names(constructor);
+        self.with_scope(names, |this| constructor.visit_mut_children_with(this));
+    }
+
     fn visit_mut_expr(&mut self, expr: &mut Expr) {
         if self.level < RewriteLevel::Aggressive {
             return;
@@ -39,7 +106,7 @@ impl VisitMut for UnTypeConstructor {
                 op: UnaryOp::Plus,
                 arg,
                 ..
-            }) if matches!(**arg, Expr::Ident(_)) => {
+            }) if matches!(**arg, Expr::Ident(_)) && self.can_synthesize("Number") => {
                 let arg = std::mem::replace(
                     arg,
                     Box::new(Expr::Lit(Lit::Num(Number {
@@ -68,7 +135,7 @@ impl VisitMut for UnTypeConstructor {
                         }))),
                     );
                     *expr = *left;
-                } else {
+                } else if self.can_synthesize("String") {
                     let left = std::mem::replace(
                         left,
                         Box::new(Expr::Lit(Lit::Num(Number {
@@ -82,7 +149,9 @@ impl VisitMut for UnTypeConstructor {
             }
 
             // [,,,] → Array(n) — all-holes array with n > 0
-            Expr::Array(ArrayLit { elems, .. }) if is_all_holes(elems) && !elems.is_empty() => {
+            Expr::Array(ArrayLit { elems, .. })
+                if is_all_holes(elems) && !elems.is_empty() && self.can_synthesize("Array") =>
+            {
                 let n = elems.len();
                 *expr = make_call(
                     "Array",
@@ -121,6 +190,73 @@ fn is_string_lit(expr: &Expr) -> bool {
 
 fn is_all_holes(elems: &[Option<ExprOrSpread>]) -> bool {
     elems.iter().all(|e| e.is_none())
+}
+
+struct ScopeNameCollector {
+    names: HashSet<String>,
+}
+
+impl ScopeNameCollector {
+    fn new() -> Self {
+        Self {
+            names: HashSet::new(),
+        }
+    }
+}
+
+impl Visit for ScopeNameCollector {
+    fn visit_binding_ident(&mut self, ident: &swc_core::ecma::ast::BindingIdent) {
+        self.names.insert(ident.id.sym.to_string());
+    }
+
+    fn visit_fn_decl(&mut self, declaration: &swc_core::ecma::ast::FnDecl) {
+        self.names.insert(declaration.ident.sym.to_string());
+    }
+
+    fn visit_class_decl(&mut self, declaration: &swc_core::ecma::ast::ClassDecl) {
+        self.names.insert(declaration.ident.sym.to_string());
+    }
+
+    fn visit_function(&mut self, _: &Function) {}
+
+    fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
+
+    fn visit_fn_expr(&mut self, _: &FnExpr) {}
+
+    fn visit_class(&mut self, _: &Class) {}
+
+    fn visit_class_expr(&mut self, _: &ClassExpr) {}
+
+    fn visit_constructor(&mut self, _: &Constructor) {}
+}
+
+fn module_scope_names(module: &Module) -> HashSet<String> {
+    let mut collector = ScopeNameCollector::new();
+    module.visit_with(&mut collector);
+    collector.names
+}
+
+fn function_scope_names(function: &Function) -> HashSet<String> {
+    let mut collector = ScopeNameCollector::new();
+    function.params.visit_with(&mut collector);
+    function.body.visit_with(&mut collector);
+    collector.names
+}
+
+fn arrow_scope_names(arrow: &ArrowExpr) -> HashSet<String> {
+    let mut collector = ScopeNameCollector::new();
+    arrow.params.visit_with(&mut collector);
+    arrow.body.visit_with(&mut collector);
+    collector.names
+}
+
+fn constructor_scope_names(constructor: &Constructor) -> HashSet<String> {
+    let mut collector = ScopeNameCollector::new();
+    constructor.params.visit_with(&mut collector);
+    if let Some(body) = &constructor.body {
+        body.visit_with(&mut collector);
+    }
+    collector.names
 }
 
 #[cfg(test)]
