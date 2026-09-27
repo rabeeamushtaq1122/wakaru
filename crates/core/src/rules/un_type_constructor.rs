@@ -2,8 +2,8 @@ use std::collections::HashSet;
 use swc_core::common::{Mark, Span, Spanned, SyntaxContext, DUMMY_SP};
 
 use swc_core::ecma::ast::{
-    ArrayLit, ArrowExpr, BinExpr, BinaryOp, CallExpr, Class, ClassExpr, Constructor, Expr,
-    ExprOrSpread, FnExpr, Function, Ident, Lit, Module, Number, Str, UnaryExpr, UnaryOp,
+    ArrayLit, ArrowExpr, AssignExpr, BinExpr, BinaryOp, CallExpr, Class, ClassExpr, Constructor,
+    Expr, ExprOrSpread, FnExpr, Function, Ident, Lit, Module, Number, Str, UnaryExpr, UnaryOp,
 };
 use swc_core::ecma::utils::ExprFactory;
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
@@ -56,6 +56,9 @@ impl VisitMut for UnTypeConstructor {
             .iter()
             .any(|name| module_blocks_global_reference(module, name))
         {
+            return;
+        }
+        if module_has_constructor_write(module) {
             return;
         }
         let names = module_scope_names(module);
@@ -257,6 +260,46 @@ fn constructor_scope_names(constructor: &Constructor) -> HashSet<String> {
         body.visit_with(&mut collector);
     }
     collector.names
+}
+
+struct ConstructorWriteFinder {
+    found: bool,
+}
+
+impl Visit for ConstructorWriteFinder {
+    fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
+        if matches!(assignment.left.as_expr(), Expr::Ident(id) if matches!(id.sym.as_ref(), "Number" | "String" | "Array"))
+        {
+            self.found = true;
+            return;
+        }
+        assignment.visit_children_with(self);
+    }
+
+    fn visit_update_expr(&mut self, update: &swc_core::ecma::ast::UpdateExpr) {
+        if matches!(update.arg.as_expr(), Expr::Ident(id) if matches!(id.sym.as_ref(), "Number" | "String" | "Array"))
+        {
+            self.found = true;
+            return;
+        }
+        update.visit_children_with(self);
+    }
+
+    fn visit_unary_expr(&mut self, unary: &swc_core::ecma::ast::UnaryExpr) {
+        if unary.op == swc_core::ecma::ast::UnaryOp::Delete
+            && matches!(unary.arg.as_expr(), Expr::Ident(id) if matches!(id.sym.as_ref(), "Number" | "String" | "Array"))
+        {
+            self.found = true;
+            return;
+        }
+        unary.visit_children_with(self);
+    }
+}
+
+fn module_has_constructor_write(module: &Module) -> bool {
+    let mut finder = ConstructorWriteFinder { found: false };
+    module.visit_with(&mut finder);
+    finder.found
 }
 
 #[cfg(test)]
